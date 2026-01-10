@@ -1,10 +1,11 @@
 """
 Script to scrape papers related to policies from OpenAlex
+Issue #1: Scrape policy papers from OpenAlex
 
 This script reads a list of policies from policies.csv and systematically
 searches OpenAlex for academic papers related to each policy.
 
-Author: Claude AI with modifications by roberto gonzalez
+Author: claude ai with modifications by roberto gonzalez
 Date: January 9, 2026
 """
 
@@ -26,7 +27,10 @@ USER_EMAIL = "rob98@stanford.edu"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 TMP_DIR = os.path.join(SCRIPT_DIR, "tmp")
-POLICIES_FILE = os.path.join(SCRIPT_DIR, "policies.csv")
+
+# Policies file location: ../get_policies/output/policies.csv
+POLICIES_FILE = os.path.join(SCRIPT_DIR, "..", "get_policies", "output", "policies.csv")
+POLICIES_FILE = os.path.normpath(POLICIES_FILE)
 
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -157,8 +161,9 @@ def extract_paper_info(work):
         # Get affiliations
         institutions = authorship.get('institutions', [])
         if institutions:
-            inst_names = [inst.get('display_name', '') for inst in institutions]
-            author_affiliations.append('; '.join(inst_names))
+            inst_names = [inst.get('display_name') or '' for inst in institutions]
+            inst_names = [name for name in inst_names if name]
+            author_affiliations.append('; '.join(inst_names) if inst_names else '')
         else:
             author_affiliations.append('')
     
