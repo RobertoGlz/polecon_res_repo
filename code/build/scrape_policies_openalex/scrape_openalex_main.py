@@ -21,7 +21,7 @@ import sys
 OPENALEX_API = "https://api.openalex.org/works"
 
 # User email for OpenAlex polite pool - REPLACE WITH YOUR EMAIL
-USER_EMAIL = "your_email@example.com"
+USER_EMAIL = "rob98@stanford.edu"
 
 # Output paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -161,8 +161,9 @@ def extract_paper_info(work):
         # Get affiliations
         institutions = authorship.get('institutions', [])
         if institutions:
-            inst_names = [inst.get('display_name', '') for inst in institutions]
-            author_affiliations.append('; '.join(inst_names))
+            inst_names = [inst.get('display_name') or '' for inst in institutions]
+            inst_names = [name for name in inst_names if name]
+            author_affiliations.append('; '.join(inst_names) if inst_namaes else '')
         else:
             author_affiliations.append('')
     
@@ -305,11 +306,6 @@ def process_policy(policy_row):
     csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
     df_unique.to_csv(csv_file, index=False, encoding='utf-8')
     print(f"  Saved CSV: {csv_file}")
-    
-    # Save as Stata file
-    stata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.dta")
-    df_unique.to_stata(stata_file, write_index=False, version=118)
-    print(f"  Saved Stata: {stata_file}")
     
     # Save metadata
     metadata = {
