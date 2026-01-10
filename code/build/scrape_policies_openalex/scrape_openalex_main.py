@@ -163,7 +163,7 @@ def extract_paper_info(work):
         if institutions:
             inst_names = [inst.get('display_name') or '' for inst in institutions]
             inst_names = [name for name in inst_names if name]
-            author_affiliations.append('; '.join(inst_names) if inst_namaes else '')
+            author_affiliations.append('; '.join(inst_names) if inst_names else '')
         else:
             author_affiliations.append('')
     
