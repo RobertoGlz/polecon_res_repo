@@ -1,10 +1,11 @@
 """
 Script to scrape papers related to policies from OpenAlex
+Issue #1: Scrape policy papers from OpenAlex
 
 This script reads a list of policies from policies.csv and systematically
 searches OpenAlex for academic papers related to each policy.
 
-Author: Claude AI with modifications by roberto gonzalez
+Author: claude ai with modifications by roberto gonzalez
 Date: January 9, 2026
 """
 
@@ -20,13 +21,16 @@ import sys
 OPENALEX_API = "https://api.openalex.org/works"
 
 # User email for OpenAlex polite pool - REPLACE WITH YOUR EMAIL
-USER_EMAIL = "rob98@stanford.edu"
+USER_EMAIL = "your_email@example.com"
 
 # Output paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 TMP_DIR = os.path.join(SCRIPT_DIR, "tmp")
-POLICIES_FILE = os.path.join(SCRIPT_DIR, "policies.csv")
+
+# Policies file location: ../get_policies/output/policies.csv
+POLICIES_FILE = os.path.join(SCRIPT_DIR, "..", "get_policies", "output", "policies.csv")
+POLICIES_FILE = os.path.normpath(POLICIES_FILE)
 
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -301,6 +305,11 @@ def process_policy(policy_row):
     csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
     df_unique.to_csv(csv_file, index=False, encoding='utf-8')
     print(f"  Saved CSV: {csv_file}")
+    
+    # Save as Stata file
+    stata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.dta")
+    df_unique.to_stata(stata_file, write_index=False, version=118)
+    print(f"  Saved Stata: {stata_file}")
     
     # Save metadata
     metadata = {
