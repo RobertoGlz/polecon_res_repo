@@ -6,7 +6,7 @@ This script systematically searches multiple sources to identify frequently-stud
 policies, generates search terms, and creates a policies.csv file for use with
 the scrape_openalex.py script.
 
-Author: Claude AI with modifications by roberto gonzalez
+Author: claude ai with modifications from roberto gonzalez
 Date: January 9, 2026
 """
 
@@ -352,25 +352,25 @@ def create_policies_dataframe():
     # 1. Start with seed policy
     print("\n1. Adding seed policy (TCJA)...")
     all_policies.append(SEED_POLICY)
-
-    # 2. Get major legislation from Congress
-    # print("\n2. Getting major legislation from Congress.gov...")
-    # congress_bills = get_major_legislation_congress()
     
-    # for bill in congress_bills:
+    # 2. Get major legislation from Congress
+    #print("\n2. Getting major legislation from Congress.gov...")
+    #congress_bills = get_major_legislation_congress()
+    
+    #for bill in congress_bills:
     #    policy = {
     #        'policy_name': bill['title'],
     #        'policy_abbreviation': bill['abbreviation'],
-    #       'policy_year': bill['year'],
+    #        'policy_year': bill['year'],
     #        'policy_category': bill['category'],
-    #       'search_terms': generate_search_terms(
+    #        'search_terms': generate_search_terms(
     #            bill['title'], 
     #            bill['abbreviation'], 
     #            bill['year'], 
     #            bill['category']
     #        )
-    #   }
-    #   all_policies.append(policy)
+    #    }
+    #    all_policies.append(policy)
     
     # 3. Search NBER for frequently mentioned policies
     #print("\n3. Searching NBER for policy-related papers...")
@@ -497,29 +497,15 @@ def main():
     output_file = os.path.join(OUTPUT_DIR, 'policies.csv')
     save_policies_csv(policies_df, output_file)
     
-    # Also copy to the scrape_policies_openalex folder for immediate use
-    target_file = os.path.join(
-        SCRIPT_DIR, '..', 'scrape_policies_openalex', 'policies.csv'
-    )
-    target_file = os.path.normpath(target_file)
-    
-    try:
-        policies_df.to_csv(target_file, index=False)
-        print(f"\nCopied policies.csv to: {target_file}")
-        print("  → Ready to use with scrape_openalex.py!")
-    except Exception as e:
-        print(f"\nWarning: Could not copy to scrape_policies_openalex folder: {e}")
-        print(f"Please manually copy {output_file} to the scrape_policies_openalex folder")
-    
     print(f"\n{'='*80}")
     print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}")
     
     print("\nNext steps:")
-    print("1. Review the generated policies.csv")
+    print("1. Review the generated policies.csv in output/ folder")
     print("2. Edit search terms if needed")
     print("3. Add or remove policies as desired")
-    print("4. Run scrape_openalex.py to collect papers")
+    print("4. Run scrape_openalex_main.py (it will read from ../get_policies/output/policies.csv)")
 
 
 if __name__ == "__main__":
