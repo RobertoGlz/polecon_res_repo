@@ -1,35 +1,38 @@
 """
-Script to complement missing abstracts using CrossRef API and SSRN scraping.
+Script to complement missing abstracts using multiple fallback sources.
 
 Issue #7: Complement missing abstracts using CrossRef API
 Parent Issue #1: Scrape policies with OpenAlex
 
 This script reads papers scraped from OpenAlex that are missing abstracts
-and attempts to retrieve them from multiple sources:
+and attempts to retrieve them from multiple sources in order:
 1. CrossRef API - for papers with DOIs
-2. SSRN web scraping - for papers from SSRN Electronic Journal
+2. Open Access URL scraping - for papers with open_access_url (e.g., PubMed, arXiv)
+3. SSRN web scraping - for papers from SSRN Electronic Journal
 
 Pipeline Overview:
 ------------------
 1. Load papers from OpenAlex scrape output (Parquet/CSV)
 2. Identify papers with missing abstracts
 3. For papers with DOIs: Query CrossRef API
-4. For SSRN papers still missing abstracts: Scrape from SSRN website
-5. Update dataset with recovered abstracts and track source
-6. Save complemented dataset in Parquet/CSV formats
+4. For papers still missing abstracts with open_access_url: Scrape from OA URL
+5. For SSRN papers still missing abstracts: Scrape from SSRN website
+6. Update dataset with recovered abstracts and track source
+7. Save complemented dataset in Parquet/CSV formats
 
 Key Implementation Notes:
 -------------------------
 - CrossRef API returns abstracts as HTML/XML; we strip tags to get plain text.
 - Uses CrossRef "polite pool" (via mailto parameter) for better rate limits.
+- Open Access URL scraping looks for common abstract HTML elements/classes.
 - SSRN blocks simple HTTP requests, so we use Selenium with headless Chrome.
 - Selenium browser is reused across SSRN requests for efficiency.
-- SSRN scraping extracts abstract from <div class="abstract-text"> element.
-- Tracks abstract source (OpenAlex, CrossRef, or SSRN) in 'abstract_source' column.
+- Tracks abstract source (OpenAlex, CrossRef, OpenAccess, SSRN) in 'abstract_source' column.
 - Preserves original data; only updates rows with missing abstracts.
 
 Dependencies:
 -------------
+- beautifulsoup4: For HTML parsing (pip install beautifulsoup4)
 - selenium: For SSRN scraping (pip install selenium)
 - Chrome browser: Must be installed on the system
 - chromedriver: Automatically managed by Selenium 4.6+
@@ -184,6 +187,141 @@ def get_abstract_from_crossref(doi, timeout=10):
         result['error'] = 'Invalid JSON response'
     except Exception as e:
         result['error'] = f'Unexpected error: {str(e)}'
+
+    return result
+
+
+def get_abstract_from_oa_url(oa_url, timeout=15):
+    """
+    Scrape abstract from an open access URL.
+
+    Many open access repositories (PubMed Central, arXiv, university repos, etc.)
+    include abstracts in their HTML pages. This function attempts to extract
+    abstracts by looking for common HTML elements and class names.
+
+    Parameters:
+    -----------
+    oa_url : str
+        Open access URL to scrape
+    timeout : int
+        Request timeout in seconds
+
+    Returns:
+    --------
+    dict : Result with keys:
+        - 'abstract': Retrieved abstract text (empty string if not found)
+        - 'success': Boolean indicating if scraping succeeded
+        - 'error': Error message if any
+        - 'has_abstract': Boolean indicating if abstract was found
+
+    Notes:
+    ------
+    - Uses browser-like headers to avoid being blocked
+    - Searches for abstract in multiple common HTML patterns:
+      * Elements with id/class containing 'abstract'
+      * <meta name="description"> or <meta name="citation_abstract">
+      * Semantic HTML5 elements like <section> or <article>
+    - Filters out short text (< 100 chars) to avoid false positives
+    - Strips HTML tags and normalizes whitespace
+    """
+    result = {
+        'abstract': '',
+        'success': False,
+        'error': None,
+        'has_abstract': False
+    }
+
+    if not oa_url or pd.isna(oa_url) or str(oa_url).strip() == '':
+        result['error'] = 'No URL provided'
+        return result
+
+    oa_url = str(oa_url).strip()
+
+    # Use browser-like headers
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    }
+
+    try:
+        response = requests.get(oa_url, headers=headers, timeout=timeout, allow_redirects=True)
+        response.raise_for_status()
+
+        # Parse HTML
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        abstract_text = None
+
+        # Strategy 1: Look for meta tags with abstract
+        meta_selectors = [
+            ('meta', {'name': 'citation_abstract'}),
+            ('meta', {'name': 'description'}),
+            ('meta', {'name': 'DC.description'}),
+            ('meta', {'property': 'og:description'}),
+        ]
+        for tag, attrs in meta_selectors:
+            meta = soup.find(tag, attrs=attrs)
+            if meta and meta.get('content'):
+                text = meta.get('content', '').strip()
+                if len(text) > 100:  # Likely an abstract, not just a short description
+                    abstract_text = text
+                    break
+
+        # Strategy 2: Look for elements with 'abstract' in id or class
+        if not abstract_text:
+            # Common abstract selectors used by various repositories
+            selectors = [
+                {'id': re.compile(r'abstract', re.I)},
+                {'class_': re.compile(r'abstract', re.I)},
+                {'id': 'abs'},
+                {'class_': 'abstract-content'},
+                {'class_': 'abstractSection'},
+                {'class_': 'abstract-text'},
+            ]
+            for selector in selectors:
+                elements = soup.find_all(**selector)
+                for elem in elements:
+                    text = elem.get_text(strip=True)
+                    # Skip if too short (likely just a label like "Abstract")
+                    if len(text) > 100:
+                        abstract_text = text
+                        break
+                if abstract_text:
+                    break
+
+        # Strategy 3: Look for <section> or <div> with abstract in attributes
+        if not abstract_text:
+            for tag in ['section', 'div', 'p', 'article']:
+                elements = soup.find_all(tag)
+                for elem in elements:
+                    # Check if 'abstract' appears in any attribute
+                    attrs_str = ' '.join(str(v) for v in elem.attrs.values() if v)
+                    if 'abstract' in attrs_str.lower():
+                        text = elem.get_text(strip=True)
+                        if len(text) > 100:
+                            abstract_text = text
+                            break
+                if abstract_text:
+                    break
+
+        if abstract_text:
+            # Clean up the text
+            abstract_text = strip_html_tags(abstract_text)
+            abstract_text = ' '.join(abstract_text.split())
+            # Remove common prefixes
+            abstract_text = re.sub(r'^(Abstract|Summary|ABSTRACT|SUMMARY):?\s*', '', abstract_text)
+            result['abstract'] = abstract_text.strip()
+            result['has_abstract'] = len(result['abstract']) > 50
+
+        result['success'] = True
+
+    except requests.exceptions.Timeout:
+        result['error'] = 'Request timeout'
+    except requests.exceptions.RequestException as e:
+        result['error'] = f'Request error: {str(e)[:100]}'
+    except Exception as e:
+        result['error'] = f'Unexpected error: {str(e)[:100]}'
 
     return result
 
@@ -408,20 +546,23 @@ def load_openalex_papers(policy_abbr):
         return None
 
 
-def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
+def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     """
-    Complement missing abstracts using CrossRef API and SSRN scraping.
+    Complement missing abstracts using multiple fallback sources.
 
     This function uses a tiered approach:
     1. First, try CrossRef API for all papers with DOIs
-    2. Then, for SSRN papers still missing abstracts, scrape from SSRN website
+    2. Then, try scraping from Open Access URLs for papers still missing abstracts
+    3. Finally, for SSRN papers still missing abstracts, scrape from SSRN website
 
     Parameters:
     -----------
     df : pd.DataFrame
-        Papers dataframe with 'abstract', 'doi', and 'source_name' columns
+        Papers dataframe with 'abstract', 'doi', 'open_access_url', and 'source_name' columns
     delay : float
         Delay between CrossRef API requests in seconds
+    oa_delay : float
+        Delay between Open Access URL requests in seconds
     ssrn_delay : float
         Delay between SSRN scraping requests in seconds (longer to be polite)
 
@@ -459,6 +600,10 @@ def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
         'crossref_failed': 0,
         'crossref_not_found': 0,
         'crossref_no_abstract': 0,
+        'oa_url_fetched': 0,
+        'oa_url_recovered': 0,
+        'oa_url_failed': 0,
+        'oa_url_no_abstract': 0,
         'ssrn_fetched': 0,
         'ssrn_recovered': 0,
         'ssrn_failed': 0,
@@ -467,13 +612,14 @@ def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
 
     # Store raw responses for debugging
     crossref_responses = []
+    oa_url_responses = []
     ssrn_responses = []
 
     # =========================================================================
     # STEP 1: Try CrossRef API for all papers with DOIs
     # =========================================================================
     if len(to_fetch_crossref) > 0:
-        print(f"\n[Step 1/2] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers...")
+        print(f"\n[Step 1/3] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers...")
 
         for idx, (df_idx, row) in enumerate(to_fetch_crossref.iterrows()):
             doi = row['doi']
@@ -519,9 +665,62 @@ def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
     print(f"  Saved CrossRef responses to: {crossref_file}")
 
     # =========================================================================
-    # STEP 2: Try SSRN scraping for SSRN papers still missing abstracts
+    # STEP 2: Try Open Access URL scraping for papers still missing abstracts
     # =========================================================================
     # Re-identify papers still missing abstracts
+    still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
+    # Identify papers with open access URLs
+    has_oa_url_mask = df['open_access_url'].notna() & (df['open_access_url'] != '')
+    to_fetch_oa = df[still_missing_mask & has_oa_url_mask]
+
+    if len(to_fetch_oa) > 0:
+        print(f"\n[Step 2/3] Scraping abstracts from Open Access URLs for {len(to_fetch_oa)} papers...")
+
+        for idx, (df_idx, row) in enumerate(to_fetch_oa.iterrows()):
+            oa_url = row['open_access_url']
+            title = row.get('title', 'Unknown')[:50]
+
+            if idx % 50 == 0 and idx > 0:
+                print(f"  Progress: {idx}/{len(to_fetch_oa)} ({stats['oa_url_recovered']} recovered)")
+
+            result = get_abstract_from_oa_url(oa_url)
+            stats['oa_url_fetched'] += 1
+
+            # Store raw response for debugging
+            oa_url_responses.append({
+                'open_access_url': oa_url,
+                'title': title,
+                'success': result['success'],
+                'has_abstract': result['has_abstract'],
+                'error': result['error'],
+                'abstract_preview': result['abstract'][:100] if result['abstract'] else None
+            })
+
+            if result['success'] and result['has_abstract']:
+                # Update the dataframe
+                df.at[df_idx, 'abstract'] = result['abstract']
+                df.at[df_idx, 'abstract_source'] = 'OpenAccess'
+                stats['oa_url_recovered'] += 1
+            elif result['success'] and not result['has_abstract']:
+                stats['oa_url_no_abstract'] += 1
+            else:
+                stats['oa_url_failed'] += 1
+
+            # Be polite to the servers
+            time.sleep(oa_delay)
+
+        print(f"  Open Access URL completed: {stats['oa_url_fetched']} fetched, {stats['oa_url_recovered']} recovered")
+
+    # Save Open Access URL responses
+    oa_url_file = os.path.join(TMP_DIR, "oa_url_responses.json")
+    with open(oa_url_file, 'w') as f:
+        json.dump(oa_url_responses, f, indent=2)
+    print(f"  Saved Open Access URL responses to: {oa_url_file}")
+
+    # =========================================================================
+    # STEP 3: Try SSRN scraping for SSRN papers still missing abstracts
+    # =========================================================================
+    # Re-identify papers still missing abstracts (after OA URL step)
     still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
     # Identify SSRN papers (by source name or DOI pattern)
     is_ssrn = (
@@ -531,7 +730,7 @@ def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
     to_fetch_ssrn = df[still_missing_mask & is_ssrn]
 
     if len(to_fetch_ssrn) > 0:
-        print(f"\n[Step 2/2] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers...")
+        print(f"\n[Step 3/3] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers...")
         print("  Initializing Selenium browser (headless Chrome)...")
 
         # Create Selenium browser for SSRN scraping
@@ -608,7 +807,7 @@ def complement_abstracts(df, delay=0.1, ssrn_delay=1.0):
     print(f"  Saved SSRN responses to: {ssrn_file}")
 
     # Calculate total recovered
-    stats['total_recovered'] = stats['crossref_recovered'] + stats['ssrn_recovered']
+    stats['total_recovered'] = stats['crossref_recovered'] + stats['oa_url_recovered'] + stats['ssrn_recovered']
 
     return df, stats
 
@@ -651,6 +850,7 @@ def process_policy(policy_abbr):
     print(f"\n  RESULTS for {policy_abbr}:")
     print(f"    Initial papers with abstracts: {initial_with_abstract}")
     print(f"    Abstracts recovered from CrossRef: {stats['crossref_recovered']}")
+    print(f"    Abstracts recovered from Open Access URLs: {stats['oa_url_recovered']}")
     print(f"    Abstracts recovered from SSRN: {stats['ssrn_recovered']}")
     print(f"    Total recovered: {stats['total_recovered']}")
     print(f"    Final papers with abstracts: {final_with_abstract}")
@@ -687,9 +887,11 @@ def process_policy(policy_abbr):
         'final_with_abstract': int(final_with_abstract),
         'abstracts_from_openalex': int((df_complemented['abstract_source'] == 'OpenAlex').sum()),
         'abstracts_from_crossref': int((df_complemented['abstract_source'] == 'CrossRef').sum()),
+        'abstracts_from_openaccess': int((df_complemented['abstract_source'] == 'OpenAccess').sum()),
         'abstracts_from_ssrn': int((df_complemented['abstract_source'] == 'SSRN').sum()),
         'still_missing': int(len(df_complemented) - final_with_abstract),
         'crossref_stats': {k: v for k, v in stats.items() if k.startswith('crossref_')},
+        'oa_url_stats': {k: v for k, v in stats.items() if k.startswith('oa_url_')},
         'ssrn_stats': {k: v for k, v in stats.items() if k.startswith('ssrn_')}
     }
 
@@ -709,7 +911,7 @@ def main():
     or defaults to TCJA if none provided.
     """
     print("=" * 80)
-    print("COMPLEMENT MISSING ABSTRACTS USING CROSSREF AND SSRN")
+    print("COMPLEMENT MISSING ABSTRACTS USING CROSSREF, OPEN ACCESS URLS, AND SSRN")
     print("=" * 80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -741,10 +943,11 @@ def main():
     for result in all_results:
         abbr = result['policy_abbreviation']
         crossref = result['abstracts_from_crossref']
+        openaccess = result['abstracts_from_openaccess']
         ssrn = result['abstracts_from_ssrn']
         total = result['total_papers']
         final = result['final_with_abstract']
-        print(f"  {abbr}: CrossRef={crossref}, SSRN={ssrn} recovered, {final}/{total} now have abstracts")
+        print(f"  {abbr}: CrossRef={crossref}, OpenAccess={openaccess}, SSRN={ssrn} recovered, {final}/{total} now have abstracts")
 
     print(f"\n{'='*80}")
     print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
