@@ -1,12 +1,28 @@
 """
-Script to scrape papers related to policies from OpenAlex
+Script to scrape papers related to policies from OpenAlex.
+
 Issue #1: Scrape policy papers from OpenAlex
 
 This script reads a list of policies from policies.csv and systematically
 searches OpenAlex for academic papers related to each policy.
 
+Pipeline Overview:
+------------------
+1. Load policy configurations from ../get_policies/output/policies.csv
+2. For each policy, search OpenAlex using configured search terms
+3. Extract paper metadata (title, authors, abstract, citations, etc.)
+4. Deduplicate results and save to Parquet/CSV formats
+
+Key Implementation Notes:
+-------------------------
+- OpenAlex stores abstracts as "inverted indices" (word -> positions mapping),
+  not plain text. The reconstruct_abstract() function handles this conversion.
+- Uses OpenAlex "polite pool" (via mailto parameter) for better rate limits.
+- Raw API responses are saved to tmp/ for debugging and reproducibility.
+
 Author: claude ai with modifications by roberto gonzalez
 Date: January 9, 2026
+Updated: January 14, 2026 - Fixed abstract extraction from inverted index
 """
 
 import requests
@@ -35,6 +51,60 @@ POLICIES_FILE = os.path.normpath(POLICIES_FILE)
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
+
+
+def reconstruct_abstract(abstract_inverted_index):
+    """
+    Reconstruct abstract text from OpenAlex's inverted index format.
+
+    OpenAlex stores abstracts as an inverted index to save space. The format is:
+    {
+        "word1": [position1, position2, ...],
+        "word2": [position3, ...],
+        ...
+    }
+
+    Each word maps to a list of positions where it appears in the abstract.
+    This function reconstructs the original text by placing each word at its
+    position(s) and joining them with spaces.
+
+    Parameters:
+    -----------
+    abstract_inverted_index : dict or None
+        The inverted index from OpenAlex API response
+
+    Returns:
+    --------
+    str : Reconstructed abstract text, or empty string if not available
+
+    Example:
+    --------
+    >>> idx = {"Hello": [0], "world": [1]}
+    >>> reconstruct_abstract(idx)
+    "Hello world"
+    """
+    if not abstract_inverted_index:
+        return ''
+
+    # Find the maximum position to determine abstract length
+    max_position = -1
+    for positions in abstract_inverted_index.values():
+        if positions:
+            max_position = max(max_position, max(positions))
+
+    if max_position < 0:
+        return ''
+
+    # Create a list to hold words at their positions
+    words = [''] * (max_position + 1)
+
+    # Place each word at its position(s)
+    for word, positions in abstract_inverted_index.items():
+        for pos in positions:
+            words[pos] = word
+
+    # Join words with spaces to form the abstract
+    return ' '.join(words)
 
 
 def load_policies(policies_file):
@@ -79,24 +149,36 @@ def load_policies(policies_file):
 
 def search_openalex(query, per_page=100, max_results=1000):
     """
-    Search OpenAlex for papers matching the query
-    
+    Search OpenAlex for papers matching the query.
+
+    Uses the OpenAlex Works API to search for academic papers. The API
+    supports full-text search across titles, abstracts, and full text.
+    Results are paginated, and this function handles pagination automatically.
+
+    API Documentation: https://docs.openalex.org/api-entities/works
+
     Parameters:
     -----------
     query : str
-        Search query string
+        Search query string (searches title, abstract, and full text)
     per_page : int
-        Number of results per page (max 200)
+        Number of results per page (max 200 per OpenAlex limits)
     max_results : int
-        Maximum number of results to retrieve
-    
+        Maximum total number of results to retrieve across all pages
+
     Returns:
     --------
-    list : List of paper dictionaries
+    list : List of work dictionaries from OpenAlex API
+
+    Notes:
+    ------
+    - Uses the 'mailto' parameter for polite pool access (faster rate limits)
+    - Includes 0.1s delay between requests to avoid rate limiting
+    - Stops early if no more results are available
     """
     all_results = []
     page = 1
-    
+
     print(f"  Searching OpenAlex for: '{query}'")
     
     while len(all_results) < max_results:
@@ -138,18 +220,38 @@ def search_openalex(query, per_page=100, max_results=1000):
 
 def extract_paper_info(work):
     """
-    Extract relevant information from OpenAlex work object
-    
+    Extract relevant information from OpenAlex work object.
+
+    This function parses the nested JSON structure returned by OpenAlex API
+    and extracts key bibliometric fields into a flat dictionary suitable
+    for tabular storage (CSV/Parquet).
+
     Parameters:
     -----------
     work : dict
-        OpenAlex work object
-    
+        OpenAlex work object (single paper from API response)
+
     Returns:
     --------
-    dict : Extracted paper information
+    dict : Extracted paper information with the following keys:
+        - openalex_id: Unique identifier in OpenAlex
+        - doi: Digital Object Identifier
+        - title: Paper title
+        - abstract: Reconstructed abstract text (from inverted index)
+        - publication_year/date: When the paper was published
+        - authors: Pipe-separated list of author names
+        - author_count: Number of authors
+        - author_affiliations: Pipe-separated list of institutions
+        - source_name/type: Journal or venue information
+        - is_open_access, open_access_url: OA status and link
+        - cited_by_count: Number of citations
+        - concepts: Pipe-separated list of topics/concepts
+        - type: Article type (e.g., 'article', 'review')
+        - language: Language code (e.g., 'en')
+        - url: Link to OpenAlex page
     """
-    # Extract author names
+    # --- Extract author information ---
+    # Each authorship contains author details and their institutional affiliations
     authors = []
     author_affiliations = []
     for authorship in work.get('authorships', []):
@@ -157,8 +259,8 @@ def extract_paper_info(work):
         author_name = author.get('display_name', '')
         if author_name:
             authors.append(author_name)
-        
-        # Get affiliations
+
+        # Get affiliations - each author may have multiple institutions
         institutions = authorship.get('institutions', [])
         if institutions:
             inst_names = [inst.get('display_name') or '' for inst in institutions]
@@ -166,19 +268,28 @@ def extract_paper_info(work):
             author_affiliations.append('; '.join(inst_names) if inst_names else '')
         else:
             author_affiliations.append('')
-    
-    # Extract concepts (topics)
+
+    # --- Extract concepts/topics ---
+    # OpenAlex assigns weighted concepts to each paper
     concepts = [c.get('display_name', '') for c in work.get('concepts', [])]
-    
-    # Extract publication info
+
+    # --- Extract publication source info ---
+    # primary_location contains the main venue (journal, repository, etc.)
     pub_info = work.get('primary_location', {}) or {}
     source = pub_info.get('source', {}) or {}
-    
+
+    # --- Reconstruct abstract from inverted index ---
+    # OpenAlex stores abstracts as inverted indices, not plain text
+    # See reconstruct_abstract() docstring for format details
+    abstract_inverted_index = work.get('abstract_inverted_index', None)
+    abstract_text = reconstruct_abstract(abstract_inverted_index)
+
+    # --- Build output dictionary ---
     paper_info = {
         'openalex_id': work.get('id', ''),
         'doi': work.get('doi', ''),
         'title': work.get('title', ''),
-        'abstract': work.get('abstract', ''),
+        'abstract': abstract_text,
         'publication_year': work.get('publication_year', ''),
         'publication_date': work.get('publication_date', ''),
         'authors': ' | '.join(authors),
@@ -194,22 +305,46 @@ def extract_paper_info(work):
         'language': work.get('language', ''),
         'url': work.get('id', '')
     }
-    
+
     return paper_info
 
 
 def process_policy(policy_row):
     """
-    Process a single policy: search OpenAlex and save results
-    
+    Process a single policy: search OpenAlex and save results.
+
+    This is the main orchestration function for each policy. It:
+    1. Parses search terms from the policy configuration
+    2. Searches OpenAlex for each term and saves raw API responses
+    3. Extracts structured paper information from results
+    4. Deduplicates papers (same paper may match multiple search terms)
+    5. Saves final dataset in Parquet and CSV formats
+    6. Generates metadata with scraping statistics
+
     Parameters:
     -----------
     policy_row : pd.Series
-        Row from policies DataFrame containing policy information
-    
+        Row from policies DataFrame with columns:
+        - policy_name: Full name (e.g., "Tax Cuts and Jobs Act")
+        - policy_abbreviation: Short code for filenames (e.g., "TCJA")
+        - policy_year: Year enacted (e.g., 2017)
+        - policy_category: Category (e.g., "tax", "health")
+        - search_terms: Pipe-separated search queries
+
     Returns:
     --------
-    dict : Summary statistics for this policy
+    dict : Summary statistics including:
+        - policy_abbreviation, policy_name
+        - total_papers: Count before deduplication
+        - unique_papers: Count after deduplication
+        - duplicates_removed: Number of duplicates found
+
+    Output Files:
+    -------------
+    - {abbr}_papers_openalex.parquet: Main dataset (efficient storage)
+    - {abbr}_papers_openalex.csv: Main dataset (compatibility)
+    - {abbr}_metadata.json: Scraping metadata and statistics
+    - tmp/raw_{abbr}_{term}.json: Raw API responses for each search term
     """
     policy_name = policy_row['policy_name']
     policy_abbr = policy_row['policy_abbreviation']
