@@ -104,7 +104,7 @@ def load_policies(policies_file):
     return df
 
 
-def search_semantic_scholar(query, limit=100, max_results=1000):
+def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
     """
     Search Semantic Scholar for papers matching the query.
 
@@ -118,6 +118,8 @@ def search_semantic_scholar(query, limit=100, max_results=1000):
         Number of results per page (max 100)
     max_results : int
         Maximum total number of results to retrieve
+    max_retries : int
+        Maximum number of retries for rate limit errors
 
     Returns:
     --------
@@ -136,30 +138,46 @@ def search_semantic_scholar(query, limit=100, max_results=1000):
             'limit': limit
         }
 
-        try:
-            response = requests.get(SEMANTIC_SCHOLAR_API, params=params)
-            response.raise_for_status()
-            data = response.json()
+        # Retry logic for rate limit errors
+        for retry in range(max_retries):
+            try:
+                response = requests.get(SEMANTIC_SCHOLAR_API, params=params)
 
-            results = data.get('data', [])
-            if not results:
-                print(f"    No more results at offset {offset}")
-                break
+                # Handle rate limit (429) with exponential backoff
+                if response.status_code == 429:
+                    wait_time = (2 ** retry) * 5  # 5, 10, 20 seconds
+                    print(f"    Rate limited. Waiting {wait_time}s before retry {retry + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                    continue
 
-            all_results.extend(results)
-            total = data.get('total', 0)
-            print(f"    Offset {offset}: {len(results)} results (total: {len(all_results)}/{total})")
+                response.raise_for_status()
+                data = response.json()
 
-            # Check if we've reached the end
-            if offset + limit >= total:
-                break
+                results = data.get('data', [])
+                if not results:
+                    print(f"    No more results at offset {offset}")
+                    return all_results[:max_results]
 
-            offset += limit
-            time.sleep(0.1)  # Be polite to the API (rate limit: 1000 req/sec unauthenticated)
+                all_results.extend(results)
+                total = data.get('total', 0)
+                print(f"    Offset {offset}: {len(results)} results (total: {len(all_results)}/{total})")
 
-        except requests.exceptions.RequestException as e:
-            print(f"    ERROR retrieving offset {offset}: {e}")
-            break
+                # Check if we've reached the end
+                if offset + limit >= total:
+                    return all_results[:max_results]
+
+                offset += limit
+                time.sleep(1.0)  # Respect rate limits - unauthenticated limit is 1 req/sec
+                break  # Success, exit retry loop
+
+            except requests.exceptions.RequestException as e:
+                if retry < max_retries - 1:
+                    wait_time = (2 ** retry) * 5
+                    print(f"    ERROR: {e}. Waiting {wait_time}s before retry {retry + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"    ERROR retrieving offset {offset}: {e}")
+                    return all_results[:max_results]
 
     return all_results[:max_results]
 
@@ -460,6 +478,9 @@ def process_policy(policy_row):
         })
 
         print(f"    Extracted info from {len(results)} papers")
+
+        # Delay between search terms to avoid rate limits
+        time.sleep(2.0)
 
     # Create DataFrame
     df = pd.DataFrame(all_papers)
