@@ -408,7 +408,14 @@ def process_policy(policy_row):
     df_unique = df.drop_duplicates(subset=['openalex_id'], keep='first')
     duplicate_count = initial_count - len(df_unique)
     print(f"    Initial: {initial_count} | Duplicates: {duplicate_count} | Unique: {len(df_unique)}")
-    
+
+    # Filter out papers published before the policy year
+    print(f"\n  Filtering papers by publication date (>= {policy_year})...")
+    pre_filter_count = len(df_unique)
+    df_unique = df_unique[df_unique['publication_year'] >= policy_year]
+    filtered_count = pre_filter_count - len(df_unique)
+    print(f"    Before filter: {pre_filter_count} | Filtered out: {filtered_count} | After filter: {len(df_unique)}")
+
     # Add metadata columns
     df_unique = df_unique.copy()
     df_unique['policy_studied'] = policy_name
@@ -451,8 +458,9 @@ def process_policy(policy_row):
         'search_terms': search_terms,
         'scrape_date': datetime.now().isoformat(),
         'total_papers_found': initial_count,
-        'unique_papers': len(df_unique),
         'duplicates_removed': duplicate_count,
+        'pre_policy_filtered': filtered_count,
+        'unique_papers': len(df_unique),
         'search_details': search_metadata
     }
     
@@ -472,8 +480,9 @@ def process_policy(policy_row):
         'policy_abbreviation': policy_abbr,
         'policy_name': policy_name,
         'total_papers': initial_count,
-        'unique_papers': len(df_unique),
-        'duplicates_removed': duplicate_count
+        'duplicates_removed': duplicate_count,
+        'pre_policy_filtered': filtered_count,
+        'unique_papers': len(df_unique)
     }
 
 
