@@ -9,17 +9,18 @@ coverage with OpenAlex results to validate data quality.
 Pipeline Overview:
 ------------------
 1. Load policy configurations from ../get_policies/output/policies.csv
-2. For each policy, search NBER using the policy abbreviation (for specificity)
+2. For each policy, search NBER using ALL search terms (pipe-separated in CSV)
 3. Extract paper metadata (title, authors, abstract, url, etc.)
-4. Filter papers by publication date (must be >= policy year)
-5. Compare with OpenAlex results to check coverage
-6. Save results and comparison report
+4. Deduplicate results across all search terms
+5. Filter papers by publication date (must be >= policy year)
+6. Compare with OpenAlex results to check coverage
+7. Save results and comparison report
 
 Key Implementation Notes:
 -------------------------
-- NBER API returns full-text search results, which can include loosely-related papers.
-- For accurate comparison, we filter to policy-specific abbreviations (TCJA, ACA, NCLB).
-- Title normalization is used for matching papers between sources.
+- Pipeline is identical to OpenAlex scraper for methodological consistency.
+- Searches all search terms from policies.csv (not just abbreviations).
+- Title normalization is used for deduplication and matching papers between sources.
 - Papers published before the policy year are filtered out.
 
 Author: Claude AI with modifications by Roberto Gonzalez
@@ -332,34 +333,49 @@ def process_policy(policy_row):
     policy_abbr = policy_row['policy_abbreviation']
     policy_year = int(policy_row['policy_year'])
     policy_category = policy_row['policy_category']
+    search_terms_str = policy_row['search_terms']
+
+    # Parse search terms (pipe-separated)
+    search_terms = [term.strip() for term in search_terms_str.split('|')]
 
     print(f"\n{'='*80}")
     print(f"Processing: {policy_name} ({policy_abbr})")
     print(f"Year: {policy_year} | Category: {policy_category}")
+    print(f"Search terms: {len(search_terms)}")
     print(f"{'='*80}")
 
-    # Search using policy abbreviation for specificity
-    # (Full-text search with policy names returns too many loosely-related papers)
-    search_term = policy_abbr
-    results = search_nber(search_term, per_page=100, max_results=1000)
-
-    # Save raw results
-    raw_file = os.path.join(TMP_DIR, f"raw_{policy_abbr}_nber.json")
-    with open(raw_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"  Saved raw results to: {raw_file}")
-
-    # Extract paper info
     all_papers = []
-    for paper in results:
-        paper_info = extract_paper_info(paper)
-        paper_info['search_term'] = search_term
-        paper_info['policy_studied'] = policy_name
-        paper_info['policy_year'] = policy_year
-        paper_info['policy_abbreviation'] = policy_abbr
-        paper_info['policy_category'] = policy_category
-        paper_info['scrape_date'] = datetime.now().strftime('%Y-%m-%d')
-        all_papers.append(paper_info)
+    search_metadata = []
+
+    # Search for each term
+    for term in search_terms:
+        results = search_nber(term, per_page=100, max_results=1000)
+
+        # Save raw results for this term
+        safe_term = term.replace(' ', '_').replace('/', '_').lower()
+        raw_file = os.path.join(TMP_DIR, f"raw_{policy_abbr}_{safe_term}.json")
+        with open(raw_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"    Saved raw results to: {raw_file}")
+
+        # Extract paper info
+        for paper in results:
+            paper_info = extract_paper_info(paper)
+            paper_info['search_term'] = term
+            paper_info['policy_studied'] = policy_name
+            paper_info['policy_year'] = policy_year
+            paper_info['policy_abbreviation'] = policy_abbr
+            paper_info['policy_category'] = policy_category
+            paper_info['scrape_date'] = datetime.now().strftime('%Y-%m-%d')
+            all_papers.append(paper_info)
+
+        search_metadata.append({
+            'search_term': term,
+            'results_count': len(results),
+            'timestamp': datetime.now().isoformat()
+        })
+
+        print(f"    Extracted info from {len(results)} papers")
 
     # Create DataFrame
     df = pd.DataFrame(all_papers)
@@ -419,12 +435,13 @@ def process_policy(policy_row):
         'policy_abbreviation': policy_abbr,
         'policy_year': policy_year,
         'policy_category': policy_category,
-        'search_term': search_term,
+        'search_terms': search_terms,
         'scrape_date': datetime.now().isoformat(),
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
-        'unique_papers': len(df_unique)
+        'unique_papers': len(df_unique),
+        'search_details': search_metadata
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_nber_metadata.json")
