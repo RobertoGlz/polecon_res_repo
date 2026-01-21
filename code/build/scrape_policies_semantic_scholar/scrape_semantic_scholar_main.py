@@ -23,6 +23,8 @@ Key Implementation Notes:
 - Title normalization is used for deduplication and matching papers between sources.
 - Papers published before the policy year are filtered out.
 - Semantic Scholar API: GET https://api.semanticscholar.org/graph/v1/paper/search
+- API key required: Set SEMANTIC_SCHOLAR_API_KEY environment variable
+- Rate limit: 1 request per second (we use 1.1s delay to stay safely under)
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
@@ -36,12 +38,27 @@ import re
 from datetime import datetime
 import os
 import sys
+from dotenv import load_dotenv
 
-# Semantic Scholar API endpoint
+# Load environment variables from .env file
+# Look for .env in the repo root (three levels up from this script)
+REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+load_dotenv(os.path.join(REPO_ROOT, ".env"))
+
+# Semantic Scholar API configuration
 SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+
+if not SEMANTIC_SCHOLAR_API_KEY:
+    print("WARNING: SEMANTIC_SCHOLAR_API_KEY not found in environment.")
+    print("Set it in .env file or as environment variable.")
+    print("Requests will be unauthenticated (shared rate limit, may hit 429 errors).")
 
 # Fields to request from API
 API_FIELDS = "paperId,title,abstract,authors,year,citationCount,venue,publicationDate,isOpenAccess,openAccessPdf"
+
+# Rate limit: 1 request per second (use 1.1s to stay safely under)
+RATE_LIMIT_DELAY = 1.1
 
 # Output paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +147,11 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
 
     print(f"  Searching Semantic Scholar for: '{query}'")
 
+    # Set up headers with API key if available
+    headers = {}
+    if SEMANTIC_SCHOLAR_API_KEY:
+        headers['x-api-key'] = SEMANTIC_SCHOLAR_API_KEY
+
     while len(all_results) < max_results:
         params = {
             'query': query,
@@ -141,7 +163,7 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
         # Retry logic for rate limit errors
         for retry in range(max_retries):
             try:
-                response = requests.get(SEMANTIC_SCHOLAR_API, params=params)
+                response = requests.get(SEMANTIC_SCHOLAR_API, params=params, headers=headers)
 
                 # Handle rate limit (429) with exponential backoff
                 if response.status_code == 429:
@@ -167,7 +189,7 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
                     return all_results[:max_results]
 
                 offset += limit
-                time.sleep(1.0)  # Respect rate limits - unauthenticated limit is 1 req/sec
+                time.sleep(RATE_LIMIT_DELAY)  # Respect rate limit: 1 req/sec
                 break  # Success, exit retry loop
 
             except requests.exceptions.RequestException as e:
@@ -479,8 +501,8 @@ def process_policy(policy_row):
 
         print(f"    Extracted info from {len(results)} papers")
 
-        # Delay between search terms to avoid rate limits
-        time.sleep(2.0)
+        # Delay between search terms to respect rate limit
+        time.sleep(RATE_LIMIT_DELAY)
 
     # Create DataFrame
     df = pd.DataFrame(all_papers)
