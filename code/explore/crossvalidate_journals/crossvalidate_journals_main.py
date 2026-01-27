@@ -1,19 +1,25 @@
 """
-Script to cross-validate QJE/AER papers against OpenAlex and Semantic Scholar datasets.
+Script to cross-validate QJE/AER papers against OpenAlex datasets.
 
-Issue #16: Scrape QJE/AER for policy papers and cross-validate
+Issue #18: Fix cross-validation logic for QJE/AER
 
-This script takes the scraped QJE and AER papers and checks how many of them
-appear in our OpenAlex (general) and Semantic Scholar datasets.
+This script compares journal-specific scrapes (QJE/AER) against OpenAlex papers
+filtered by source. The validation checks:
+- Intersection between QJE scrape and OpenAlex (source=QJE)
+- Intersection between AER scrape and OpenAlex (source=AER)
+- Papers in QJE scrape but NOT in OpenAlex (source=QJE)
+- Papers in AER scrape but NOT in OpenAlex (source=AER)
+- Papers in OpenAlex (source=QJE) but NOT in QJE scrape
+- Papers in OpenAlex (source=AER) but NOT in AER scrape
 
 Pipeline Overview:
 ------------------
-1. Load QJE papers for each policy
-2. Load AER papers for each policy
+1. Load QJE papers for each policy (from journal-specific scrape)
+2. Load AER papers for each policy (from journal-specific scrape)
 3. Load OpenAlex (general) papers for each policy
-4. Load Semantic Scholar papers for each policy
+4. Filter OpenAlex to source=QJE and source=AER subsets
 5. Cross-validate using normalized title matching
-6. Generate indicators and summary statistics
+6. Generate detailed comparison statistics
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
@@ -33,16 +39,18 @@ OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
 QJE_DIR = os.path.join(SCRIPT_DIR, "..", "scrape_policies_qje", "output")
 AER_DIR = os.path.join(SCRIPT_DIR, "..", "scrape_policies_aer", "output")
 OPENALEX_DIR = os.path.join(SCRIPT_DIR, "..", "..", "build", "scrape_policies_openalex", "output")
-SEMANTIC_SCHOLAR_DIR = os.path.join(SCRIPT_DIR, "..", "..", "build", "scrape_policies_semantic_scholar", "output")
 
 # Policies file (in build folder)
 POLICIES_FILE = os.path.join(SCRIPT_DIR, "..", "..", "build", "get_policies", "output", "policies.csv")
+
+# Journal source names in OpenAlex
+QJE_SOURCE_NAME = "The Quarterly Journal of Economics"
+AER_SOURCE_NAME = "The American Economic Review"
 
 # Normalize paths
 QJE_DIR = os.path.normpath(QJE_DIR)
 AER_DIR = os.path.normpath(AER_DIR)
 OPENALEX_DIR = os.path.normpath(OPENALEX_DIR)
-SEMANTIC_SCHOLAR_DIR = os.path.normpath(SEMANTIC_SCHOLAR_DIR)
 POLICIES_FILE = os.path.normpath(POLICIES_FILE)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -76,41 +84,77 @@ def load_parquet_safe(filepath):
         return pd.DataFrame()
 
 
-def crossvalidate_journal(journal_df, openalex_df, semantic_scholar_df, journal_name):
+def filter_openalex_by_source(openalex_df, source_name):
     """
-    Cross-validate journal papers against OpenAlex and Semantic Scholar.
-
-    Returns the journal DataFrame with added indicator columns.
+    Filter OpenAlex DataFrame to papers from a specific journal source.
+    Uses case-insensitive partial matching on source_name.
     """
-    if len(journal_df) == 0:
-        return journal_df
+    if len(openalex_df) == 0:
+        return pd.DataFrame()
 
-    # Ensure normalized_title exists
-    if 'normalized_title' not in journal_df.columns:
+    # Extract journal name without "The" for flexible matching
+    journal_key = source_name.replace("The ", "")
+    mask = openalex_df['source_name'].str.contains(journal_key, case=False, na=False)
+    filtered = openalex_df[mask].copy()
+    return filtered
+
+
+def crossvalidate_journal(journal_df, openalex_filtered_df, journal_name):
+    """
+    Cross-validate journal-specific scrape against OpenAlex filtered by source.
+
+    Returns:
+        dict with comparison results:
+        - journal_df with 'in_openalex' indicator
+        - openalex_filtered_df with 'in_journal_scrape' indicator
+        - counts for each category
+    """
+    results = {
+        'journal_total': len(journal_df),
+        'openalex_filtered_total': len(openalex_filtered_df),
+        'intersection': 0,
+        'in_journal_not_openalex': 0,
+        'in_openalex_not_journal': 0,
+    }
+
+    if len(journal_df) == 0 and len(openalex_filtered_df) == 0:
+        return results, journal_df, openalex_filtered_df
+
+    # Ensure normalized_title exists in journal_df
+    if len(journal_df) > 0:
         journal_df = journal_df.copy()
-        journal_df['normalized_title'] = journal_df['title'].apply(normalize_title)
+        if 'normalized_title' not in journal_df.columns:
+            journal_df['normalized_title'] = journal_df['title'].apply(normalize_title)
+        journal_titles = set(journal_df['normalized_title'].dropna())
+    else:
+        journal_titles = set()
 
-    # Create sets of normalized titles for fast lookup
-    openalex_titles = set()
-    if len(openalex_df) > 0:
-        if 'normalized_title' not in openalex_df.columns:
-            openalex_df = openalex_df.copy()
-            openalex_df['normalized_title'] = openalex_df['title'].apply(normalize_title)
-        openalex_titles = set(openalex_df['normalized_title'].dropna())
+    # Ensure normalized_title exists in openalex_filtered_df
+    if len(openalex_filtered_df) > 0:
+        openalex_filtered_df = openalex_filtered_df.copy()
+        if 'normalized_title' not in openalex_filtered_df.columns:
+            openalex_filtered_df['normalized_title'] = openalex_filtered_df['title'].apply(normalize_title)
+        openalex_titles = set(openalex_filtered_df['normalized_title'].dropna())
+    else:
+        openalex_titles = set()
 
-    semantic_scholar_titles = set()
-    if len(semantic_scholar_df) > 0:
-        if 'normalized_title' not in semantic_scholar_df.columns:
-            semantic_scholar_df = semantic_scholar_df.copy()
-            semantic_scholar_df['normalized_title'] = semantic_scholar_df['title'].apply(normalize_title)
-        semantic_scholar_titles = set(semantic_scholar_df['normalized_title'].dropna())
+    # Calculate set operations
+    intersection = journal_titles & openalex_titles
+    in_journal_not_openalex = journal_titles - openalex_titles
+    in_openalex_not_journal = openalex_titles - journal_titles
+
+    results['intersection'] = len(intersection)
+    results['in_journal_not_openalex'] = len(in_journal_not_openalex)
+    results['in_openalex_not_journal'] = len(in_openalex_not_journal)
 
     # Add indicator columns
-    journal_df = journal_df.copy()
-    journal_df['in_openalex'] = journal_df['normalized_title'].isin(openalex_titles)
-    journal_df['in_semantic_scholar'] = journal_df['normalized_title'].isin(semantic_scholar_titles)
+    if len(journal_df) > 0:
+        journal_df['in_openalex'] = journal_df['normalized_title'].isin(openalex_titles)
 
-    return journal_df
+    if len(openalex_filtered_df) > 0:
+        openalex_filtered_df['in_journal_scrape'] = openalex_filtered_df['normalized_title'].isin(journal_titles)
+
+    return results, journal_df, openalex_filtered_df
 
 
 def process_policy(policy_abbr, policy_name):
@@ -126,68 +170,77 @@ def process_policy(policy_abbr, policy_name):
     qje_df = load_parquet_safe(os.path.join(QJE_DIR, f"{policy_abbr}_papers_qje.parquet"))
     aer_df = load_parquet_safe(os.path.join(AER_DIR, f"{policy_abbr}_papers_aer.parquet"))
     openalex_df = load_parquet_safe(os.path.join(OPENALEX_DIR, f"{policy_abbr}_papers_openalex.parquet"))
-    semantic_scholar_df = load_parquet_safe(os.path.join(SEMANTIC_SCHOLAR_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet"))
+
+    # Filter OpenAlex by source
+    print("\n  Filtering OpenAlex by journal source...")
+    openalex_qje = filter_openalex_by_source(openalex_df, QJE_SOURCE_NAME)
+    openalex_aer = filter_openalex_by_source(openalex_df, AER_SOURCE_NAME)
+    print(f"    OpenAlex papers with source=QJE: {len(openalex_qje)}")
+    print(f"    OpenAlex papers with source=AER: {len(openalex_aer)}")
 
     results = {
         'policy_abbreviation': policy_abbr,
         'policy_name': policy_name,
-        'qje_total': len(qje_df),
-        'aer_total': len(aer_df),
         'openalex_total': len(openalex_df),
-        'semantic_scholar_total': len(semantic_scholar_df),
     }
 
     # Cross-validate QJE
-    if len(qje_df) > 0:
-        print("\n  Cross-validating QJE papers...")
-        qje_validated = crossvalidate_journal(qje_df, openalex_df, semantic_scholar_df, 'QJE')
+    print("\n  Cross-validating QJE papers...")
+    qje_results, qje_validated, openalex_qje_validated = crossvalidate_journal(
+        qje_df, openalex_qje, 'QJE'
+    )
 
-        qje_in_openalex = qje_validated['in_openalex'].sum()
-        qje_in_ss = qje_validated['in_semantic_scholar'].sum()
+    results['qje_scrape_total'] = qje_results['journal_total']
+    results['openalex_qje_total'] = qje_results['openalex_filtered_total']
+    results['qje_intersection'] = qje_results['intersection']
+    results['qje_in_scrape_not_openalex'] = qje_results['in_journal_not_openalex']
+    results['qje_in_openalex_not_scrape'] = qje_results['in_openalex_not_journal']
 
-        results['qje_in_openalex'] = int(qje_in_openalex)
-        results['qje_in_openalex_pct'] = round(qje_in_openalex / len(qje_df) * 100, 1) if len(qje_df) > 0 else 0
-        results['qje_in_semantic_scholar'] = int(qje_in_ss)
-        results['qje_in_semantic_scholar_pct'] = round(qje_in_ss / len(qje_df) * 100, 1) if len(qje_df) > 0 else 0
+    print(f"    QJE scrape total: {qje_results['journal_total']}")
+    print(f"    OpenAlex (source=QJE) total: {qje_results['openalex_filtered_total']}")
+    print(f"    Intersection: {qje_results['intersection']}")
+    print(f"    In QJE scrape but NOT in OpenAlex: {qje_results['in_journal_not_openalex']}")
+    print(f"    In OpenAlex (source=QJE) but NOT in QJE scrape: {qje_results['in_openalex_not_journal']}")
 
-        # Save QJE cross-validation results
-        qje_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_qje_crossvalidation.csv")
+    # Save QJE cross-validation results
+    if len(qje_validated) > 0:
+        qje_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_qje_scrape_crossvalidation.csv")
         qje_validated.to_csv(qje_output, index=False)
         print(f"    Saved: {qje_output}")
 
-        print(f"    QJE papers in OpenAlex: {qje_in_openalex}/{len(qje_df)} ({results['qje_in_openalex_pct']}%)")
-        print(f"    QJE papers in Semantic Scholar: {qje_in_ss}/{len(qje_df)} ({results['qje_in_semantic_scholar_pct']}%)")
-    else:
-        results['qje_in_openalex'] = 0
-        results['qje_in_openalex_pct'] = 0
-        results['qje_in_semantic_scholar'] = 0
-        results['qje_in_semantic_scholar_pct'] = 0
+    if len(openalex_qje_validated) > 0:
+        openalex_qje_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_openalex_qje_crossvalidation.csv")
+        openalex_qje_validated.to_csv(openalex_qje_output, index=False)
+        print(f"    Saved: {openalex_qje_output}")
 
     # Cross-validate AER
-    if len(aer_df) > 0:
-        print("\n  Cross-validating AER papers...")
-        aer_validated = crossvalidate_journal(aer_df, openalex_df, semantic_scholar_df, 'AER')
+    print("\n  Cross-validating AER papers...")
+    aer_results, aer_validated, openalex_aer_validated = crossvalidate_journal(
+        aer_df, openalex_aer, 'AER'
+    )
 
-        aer_in_openalex = aer_validated['in_openalex'].sum()
-        aer_in_ss = aer_validated['in_semantic_scholar'].sum()
+    results['aer_scrape_total'] = aer_results['journal_total']
+    results['openalex_aer_total'] = aer_results['openalex_filtered_total']
+    results['aer_intersection'] = aer_results['intersection']
+    results['aer_in_scrape_not_openalex'] = aer_results['in_journal_not_openalex']
+    results['aer_in_openalex_not_scrape'] = aer_results['in_openalex_not_journal']
 
-        results['aer_in_openalex'] = int(aer_in_openalex)
-        results['aer_in_openalex_pct'] = round(aer_in_openalex / len(aer_df) * 100, 1) if len(aer_df) > 0 else 0
-        results['aer_in_semantic_scholar'] = int(aer_in_ss)
-        results['aer_in_semantic_scholar_pct'] = round(aer_in_ss / len(aer_df) * 100, 1) if len(aer_df) > 0 else 0
+    print(f"    AER scrape total: {aer_results['journal_total']}")
+    print(f"    OpenAlex (source=AER) total: {aer_results['openalex_filtered_total']}")
+    print(f"    Intersection: {aer_results['intersection']}")
+    print(f"    In AER scrape but NOT in OpenAlex: {aer_results['in_journal_not_openalex']}")
+    print(f"    In OpenAlex (source=AER) but NOT in AER scrape: {aer_results['in_openalex_not_journal']}")
 
-        # Save AER cross-validation results
-        aer_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_aer_crossvalidation.csv")
+    # Save AER cross-validation results
+    if len(aer_validated) > 0:
+        aer_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_aer_scrape_crossvalidation.csv")
         aer_validated.to_csv(aer_output, index=False)
         print(f"    Saved: {aer_output}")
 
-        print(f"    AER papers in OpenAlex: {aer_in_openalex}/{len(aer_df)} ({results['aer_in_openalex_pct']}%)")
-        print(f"    AER papers in Semantic Scholar: {aer_in_ss}/{len(aer_df)} ({results['aer_in_semantic_scholar_pct']}%)")
-    else:
-        results['aer_in_openalex'] = 0
-        results['aer_in_openalex_pct'] = 0
-        results['aer_in_semantic_scholar'] = 0
-        results['aer_in_semantic_scholar_pct'] = 0
+    if len(openalex_aer_validated) > 0:
+        openalex_aer_output = os.path.join(OUTPUT_DIR, f"{policy_abbr}_openalex_aer_crossvalidation.csv")
+        openalex_aer_validated.to_csv(openalex_aer_output, index=False)
+        print(f"    Saved: {openalex_aer_output}")
 
     # Save policy summary
     summary_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_journal_summary.json")
@@ -203,7 +256,7 @@ def main():
     Main execution function.
     """
     print("="*80)
-    print("CROSS-VALIDATION: QJE/AER vs OpenAlex/Semantic Scholar")
+    print("CROSS-VALIDATION: QJE/AER Scrapes vs OpenAlex (filtered by source)")
     print("="*80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
@@ -235,14 +288,25 @@ def main():
 
     summary_df = pd.DataFrame(all_results)
 
-    # Display summary
-    display_cols = [
+    # Display summary for QJE
+    print("\nQJE Cross-Validation:")
+    qje_cols = [
         'policy_abbreviation',
-        'qje_total', 'qje_in_openalex_pct', 'qje_in_semantic_scholar_pct',
-        'aer_total', 'aer_in_openalex_pct', 'aer_in_semantic_scholar_pct'
+        'qje_scrape_total', 'openalex_qje_total', 'qje_intersection',
+        'qje_in_scrape_not_openalex', 'qje_in_openalex_not_scrape'
     ]
-    available_cols = [c for c in display_cols if c in summary_df.columns]
-    print(summary_df[available_cols].to_string(index=False))
+    available_qje_cols = [c for c in qje_cols if c in summary_df.columns]
+    print(summary_df[available_qje_cols].to_string(index=False))
+
+    # Display summary for AER
+    print("\nAER Cross-Validation:")
+    aer_cols = [
+        'policy_abbreviation',
+        'aer_scrape_total', 'openalex_aer_total', 'aer_intersection',
+        'aer_in_scrape_not_openalex', 'aer_in_openalex_not_scrape'
+    ]
+    available_aer_cols = [c for c in aer_cols if c in summary_df.columns]
+    print(summary_df[available_aer_cols].to_string(index=False))
 
     # Save overall summary
     overall_file = os.path.join(OUTPUT_DIR, "overall_journal_summary.csv")

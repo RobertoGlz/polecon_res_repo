@@ -17,6 +17,7 @@ QJE OpenAlex Source ID: S203860005
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
+Updated: January 27, 2026 - Increased max_results to 1500, added relevance filtering
 """
 
 import requests
@@ -26,6 +27,7 @@ import time
 from datetime import datetime
 import os
 import sys
+import re
 
 # OpenAlex API endpoint
 OPENALEX_API = "https://api.openalex.org/works"
@@ -205,6 +207,37 @@ def extract_paper_info(work):
     return paper_info
 
 
+def filter_by_relevance(df, search_terms):
+    """
+    Filter papers by relevance based on search term presence in title/abstract.
+
+    Logic:
+    - If paper has title AND abstract: keep only if at least one search term
+      appears in either title or abstract (case-insensitive)
+    - If paper has only title (no abstract): keep the paper
+    """
+    if len(df) == 0:
+        return df
+
+    def is_relevant(row):
+        title = str(row.get('title', '')).lower()
+        abstract = str(row.get('abstract', '')).lower()
+
+        if not abstract or abstract == 'nan' or abstract == '' or abstract == 'none':
+            return True
+
+        text = title + ' ' + abstract
+        for term in search_terms:
+            term_lower = term.lower()
+            if term_lower in text:
+                return True
+
+        return False
+
+    mask = df.apply(is_relevant, axis=1)
+    return df[mask].copy()
+
+
 def process_policy(policy_row):
     """
     Process a single policy: search QJE and save results.
@@ -227,7 +260,7 @@ def process_policy(policy_row):
     search_metadata = []
 
     for term in search_terms:
-        results = search_qje(term, per_page=100, max_results=500)
+        results = search_qje(term, per_page=100, max_results=1500)
 
         safe_term = term.replace(' ', '_').replace('/', '_').lower()
         raw_file = os.path.join(TMP_DIR, f"raw_{policy_abbr}_{safe_term}.json")
@@ -273,6 +306,13 @@ def process_policy(policy_row):
     filtered_count = pre_filter_count - len(df_unique)
     print(f"    Before filter: {pre_filter_count} | Filtered out: {filtered_count} | After filter: {len(df_unique)}")
 
+    # Filter by relevance (search terms in title/abstract)
+    print(f"\n  Filtering by relevance (search terms in title/abstract)...")
+    pre_relevance_count = len(df_unique)
+    df_unique = filter_by_relevance(df_unique, search_terms)
+    relevance_filtered = pre_relevance_count - len(df_unique)
+    print(f"    Before filter: {pre_relevance_count} | Filtered out: {relevance_filtered} | After filter: {len(df_unique)}")
+
     df_unique = df_unique.copy()
     df_unique['policy_studied'] = policy_name
     df_unique['policy_year'] = policy_year
@@ -314,6 +354,7 @@ def process_policy(policy_row):
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
+        'relevance_filtered': relevance_filtered,
         'unique_papers': len(df_unique),
         'search_details': search_metadata
     }
@@ -335,6 +376,7 @@ def process_policy(policy_row):
         'total_papers': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
+        'relevance_filtered': relevance_filtered,
         'unique_papers': len(df_unique)
     }
 

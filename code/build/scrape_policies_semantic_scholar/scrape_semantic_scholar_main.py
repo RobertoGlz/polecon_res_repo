@@ -28,6 +28,7 @@ Key Implementation Notes:
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
+Updated: January 27, 2026 - Increased max_results to 1500, added relevance filtering
 """
 
 import requests
@@ -268,6 +269,51 @@ def normalize_title(title):
     return title
 
 
+def filter_by_relevance(df, search_terms):
+    """
+    Filter papers by relevance based on search term presence in title/abstract.
+
+    Logic:
+    - If paper has title AND abstract: keep only if at least one search term
+      appears in either title or abstract (case-insensitive)
+    - If paper has only title (no abstract): keep the paper
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with 'title' and 'abstract' columns
+    search_terms : list
+        List of search terms to look for
+
+    Returns:
+    --------
+    pd.DataFrame : Filtered DataFrame with only relevant papers
+    """
+    if len(df) == 0:
+        return df
+
+    def is_relevant(row):
+        title = str(row.get('title', '')).lower()
+        abstract = str(row.get('abstract', '')).lower()
+
+        # If no abstract, keep the paper (we'll filter again after complementing)
+        if not abstract or abstract == 'nan' or abstract == '' or abstract == 'none':
+            return True
+
+        # If we have both title and abstract, check for search term presence
+        text = title + ' ' + abstract
+        for term in search_terms:
+            term_lower = term.lower()
+            if term_lower in text:
+                return True
+
+        return False
+
+    # Apply filter
+    mask = df.apply(is_relevant, axis=1)
+    return df[mask].copy()
+
+
 def compare_with_openalex(policy_abbr):
     """
     Compare Semantic Scholar papers with OpenAlex coverage.
@@ -473,7 +519,7 @@ def process_policy(policy_row):
 
     # Search for each term
     for term in search_terms:
-        results = search_semantic_scholar(term, limit=100, max_results=1000)
+        results = search_semantic_scholar(term, limit=100, max_results=1500)
 
         # Save raw results for this term
         safe_term = term.replace(' ', '_').replace('/', '_').lower()
@@ -538,6 +584,13 @@ def process_policy(policy_row):
     filtered_count = pre_filter_count - len(df_unique)
     print(f"    Before filter: {pre_filter_count} | Filtered out: {filtered_count} | After filter: {len(df_unique)}")
 
+    # Filter by relevance (search terms in title/abstract)
+    print(f"\n  Filtering by relevance (search terms in title/abstract)...")
+    pre_relevance_count = len(df_unique)
+    df_unique = filter_by_relevance(df_unique, search_terms)
+    relevance_filtered = pre_relevance_count - len(df_unique)
+    print(f"    Before filter: {pre_relevance_count} | Filtered out: {relevance_filtered} | After filter: {len(df_unique)}")
+
     # Add normalized title for comparison
     df_unique = df_unique.copy()
     df_unique['normalized_title'] = df_unique['title'].apply(normalize_title)
@@ -572,6 +625,7 @@ def process_policy(policy_row):
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
+        'relevance_filtered': relevance_filtered,
         'unique_papers': len(df_unique),
         'search_details': search_metadata
     }
@@ -596,6 +650,7 @@ def process_policy(policy_row):
         'total_papers': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
+        'relevance_filtered': relevance_filtered,
         'unique_papers': len(df_unique)
     }
 

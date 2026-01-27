@@ -39,6 +39,7 @@ Dependencies:
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 14, 2026
+Updated: January 27, 2026 - Added relevance filtering after abstract recovery
 """
 
 import requests
@@ -75,6 +76,10 @@ TMP_DIR = os.path.join(SCRIPT_DIR, "tmp")
 OPENALEX_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "scrape_policies_openalex", "output")
 OPENALEX_OUTPUT_DIR = os.path.normpath(OPENALEX_OUTPUT_DIR)
 
+# Policies file for getting search terms
+POLICIES_FILE = os.path.join(SCRIPT_DIR, "..", "get_policies", "output", "policies.csv")
+POLICIES_FILE = os.path.normpath(POLICIES_FILE)
+
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
@@ -105,6 +110,99 @@ def strip_html_tags(text):
     # Normalize whitespace
     clean = ' '.join(clean.split())
     return clean.strip()
+
+
+def load_search_terms(policy_abbr):
+    """
+    Load search terms for a policy from the policies CSV file.
+
+    Parameters:
+    -----------
+    policy_abbr : str
+        Policy abbreviation (e.g., "TCJA")
+
+    Returns:
+    --------
+    list : List of search terms, or empty list if not found
+    """
+    if not os.path.exists(POLICIES_FILE):
+        print(f"  WARNING: Policies file not found: {POLICIES_FILE}")
+        return []
+
+    policies_df = pd.read_csv(POLICIES_FILE)
+    policy_row = policies_df[policies_df['policy_abbreviation'] == policy_abbr]
+
+    if len(policy_row) == 0:
+        print(f"  WARNING: Policy {policy_abbr} not found in policies file")
+        return []
+
+    search_terms_str = policy_row.iloc[0]['search_terms']
+    search_terms = [term.strip() for term in search_terms_str.split('|')]
+    return search_terms
+
+
+def filter_by_relevance(df, search_terms):
+    """
+    Filter papers by relevance based on search term presence in title/abstract.
+
+    Logic:
+    - If paper has title AND abstract: keep only if at least one search term
+      appears in either title or abstract (case-insensitive)
+    - If paper has only title (no abstract): keep the paper
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with 'title' and 'abstract' columns
+    search_terms : list
+        List of search terms to look for
+
+    Returns:
+    --------
+    tuple: (filtered_df, stats_dict)
+        - filtered_df: DataFrame with only relevant papers
+        - stats_dict: Dictionary with filtering statistics
+    """
+    if len(df) == 0 or len(search_terms) == 0:
+        return df, {'kept': len(df), 'filtered_with_abstract': 0, 'kept_no_abstract': 0}
+
+    stats = {
+        'kept': 0,
+        'filtered_with_abstract': 0,
+        'kept_no_abstract': 0,
+        'kept_with_abstract_match': 0
+    }
+
+    def is_relevant(row):
+        title = str(row.get('title', '')).lower()
+        abstract = str(row.get('abstract', '')).lower()
+
+        # Check if abstract is missing/empty
+        has_abstract = abstract and abstract != 'nan' and abstract.strip() != '' and abstract != 'none'
+
+        if not has_abstract:
+            # No abstract - keep the paper
+            stats['kept_no_abstract'] += 1
+            return True
+
+        # Has abstract - check for search term presence
+        text = title + ' ' + abstract
+        for term in search_terms:
+            term_lower = term.lower()
+            if term_lower in text:
+                stats['kept_with_abstract_match'] += 1
+                return True
+
+        # Has abstract but no search term match - filter out
+        stats['filtered_with_abstract'] += 1
+        return False
+
+    # Apply filter
+    mask = df.apply(is_relevant, axis=1)
+    filtered_df = df[mask].copy()
+    stats['kept'] = len(filtered_df)
+
+    return filtered_df, stats
 
 
 def get_abstract_from_crossref(doi, timeout=10):
@@ -814,7 +912,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
 
 def process_policy(policy_abbr):
     """
-    Process a single policy: load papers, complement abstracts, save results.
+    Process a single policy: load papers, complement abstracts, apply relevance filter, save results.
 
     Parameters:
     -----------
@@ -836,25 +934,29 @@ def process_policy(policy_abbr):
 
     print(f"Loaded {len(df)} papers")
 
+    # Load search terms for relevance filtering
+    search_terms = load_search_terms(policy_abbr)
+    print(f"Loaded {len(search_terms)} search terms for relevance filtering")
+
     # Count initial abstracts
     initial_with_abstract = ((df['abstract'].notna()) & (df['abstract'] != '')).sum()
 
     # Complement abstracts
     df_complemented, stats = complement_abstracts(df)
 
-    # Count final abstracts
-    final_with_abstract = ((df_complemented['abstract'].notna()) &
-                           (df_complemented['abstract'] != '')).sum()
+    # Count abstracts after complementing
+    after_complement_with_abstract = ((df_complemented['abstract'].notna()) &
+                                       (df_complemented['abstract'] != '')).sum()
 
-    # Summary
-    print(f"\n  RESULTS for {policy_abbr}:")
+    # Summary of complementation
+    print(f"\n  COMPLEMENTATION RESULTS for {policy_abbr}:")
     print(f"    Initial papers with abstracts: {initial_with_abstract}")
     print(f"    Abstracts recovered from CrossRef: {stats['crossref_recovered']}")
     print(f"    Abstracts recovered from Open Access URLs: {stats['oa_url_recovered']}")
     print(f"    Abstracts recovered from SSRN: {stats['ssrn_recovered']}")
     print(f"    Total recovered: {stats['total_recovered']}")
-    print(f"    Final papers with abstracts: {final_with_abstract}")
-    print(f"    Papers still missing abstracts: {len(df_complemented) - final_with_abstract}")
+    print(f"    Papers with abstracts after complementing: {after_complement_with_abstract}")
+    print(f"    Papers still missing abstracts: {len(df_complemented) - after_complement_with_abstract}")
 
     # Abstract source breakdown
     if 'abstract_source' in df_complemented.columns:
@@ -864,32 +966,70 @@ def process_policy(policy_abbr):
             if source:
                 print(f"      {source}: {count}")
 
+    # =========================================================================
+    # APPLY RELEVANCE FILTERING
+    # =========================================================================
+    # Now that we have recovered abstracts, re-apply relevance filter:
+    # - Papers with abstract: keep only if search term in title/abstract
+    # - Papers without abstract: keep (we couldn't verify relevance)
+    print(f"\n  Applying relevance filter (search terms in title/abstract)...")
+    pre_filter_count = len(df_complemented)
+    df_filtered, filter_stats = filter_by_relevance(df_complemented, search_terms)
+
+    print(f"    Before filter: {pre_filter_count}")
+    print(f"    Papers with abstract but no search term match (filtered out): {filter_stats['filtered_with_abstract']}")
+    print(f"    Papers with abstract and search term match (kept): {filter_stats['kept_with_abstract_match']}")
+    print(f"    Papers without abstract (kept): {filter_stats['kept_no_abstract']}")
+    print(f"    After filter: {len(df_filtered)}")
+
+    # Final counts
+    final_with_abstract = ((df_filtered['abstract'].notna()) & (df_filtered['abstract'] != '')).sum()
+    final_without_abstract = len(df_filtered) - final_with_abstract
+
+    print(f"\n  FINAL RESULTS for {policy_abbr}:")
+    print(f"    Total papers after filtering: {len(df_filtered)}")
+    print(f"    Papers with abstracts: {final_with_abstract}")
+    print(f"    Papers without abstracts (kept for later recovery): {final_without_abstract}")
+
     # Save outputs
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    # Save complemented (before filter) for reference
+    parquet_file_complemented = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_complemented.parquet")
+    df_complemented.to_parquet(parquet_file_complemented, index=False, engine='pyarrow')
+    print(f"\n  Saved complemented (before filter): {parquet_file_complemented}")
 
-    # Save as Parquet (primary format)
-    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_complemented.parquet")
-    df_complemented.to_parquet(parquet_file, index=False, engine='pyarrow')
-    print(f"\n  Saved Parquet: {parquet_file}")
+    # Save filtered (final output)
+    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_complemented_filtered.parquet")
+    df_filtered.to_parquet(parquet_file, index=False, engine='pyarrow')
+    print(f"  Saved filtered Parquet: {parquet_file}")
 
-    # Save as CSV (for compatibility)
-    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_complemented.csv")
-    df_complemented.to_csv(csv_file, index=False, encoding='utf-8')
-    print(f"  Saved CSV: {csv_file}")
+    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_complemented_filtered.csv")
+    df_filtered.to_csv(csv_file, index=False, encoding='utf-8')
+    print(f"  Saved filtered CSV: {csv_file}")
 
     # Save metadata
     metadata = {
         'policy_abbreviation': policy_abbr,
         'process_date': datetime.now().isoformat(),
         'input_file': os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet"),
-        'total_papers': len(df_complemented),
+        'search_terms': search_terms,
+        'initial_papers': len(df),
         'initial_with_abstract': int(initial_with_abstract),
-        'final_with_abstract': int(final_with_abstract),
+        'after_complement_with_abstract': int(after_complement_with_abstract),
         'abstracts_from_openalex': int((df_complemented['abstract_source'] == 'OpenAlex').sum()),
         'abstracts_from_crossref': int((df_complemented['abstract_source'] == 'CrossRef').sum()),
         'abstracts_from_openaccess': int((df_complemented['abstract_source'] == 'OpenAccess').sum()),
         'abstracts_from_ssrn': int((df_complemented['abstract_source'] == 'SSRN').sum()),
-        'still_missing': int(len(df_complemented) - final_with_abstract),
+        'still_missing_after_complement': int(len(df_complemented) - after_complement_with_abstract),
+        'relevance_filter': {
+            'before_filter': pre_filter_count,
+            'filtered_with_abstract': filter_stats['filtered_with_abstract'],
+            'kept_with_abstract_match': filter_stats['kept_with_abstract_match'],
+            'kept_no_abstract': filter_stats['kept_no_abstract'],
+            'after_filter': len(df_filtered)
+        },
+        'final_papers': len(df_filtered),
+        'final_with_abstract': int(final_with_abstract),
+        'final_without_abstract': int(final_without_abstract),
         'crossref_stats': {k: v for k, v in stats.items() if k.startswith('crossref_')},
         'oa_url_stats': {k: v for k, v in stats.items() if k.startswith('oa_url_')},
         'ssrn_stats': {k: v for k, v in stats.items() if k.startswith('ssrn_')}
@@ -908,18 +1048,23 @@ def main():
     Main execution function.
 
     Processes all policy abbreviations provided as command line arguments,
-    or defaults to TCJA if none provided.
+    or all policies from the policies.csv file if none provided.
     """
     print("=" * 80)
-    print("COMPLEMENT MISSING ABSTRACTS USING CROSSREF, OPEN ACCESS URLS, AND SSRN")
+    print("COMPLEMENT MISSING ABSTRACTS AND APPLY RELEVANCE FILTER")
     print("=" * 80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Get policy abbreviations from command line or use default
+    # Get policy abbreviations from command line or load from policies file
     if len(sys.argv) > 1:
         policy_abbrs = sys.argv[1:]
     else:
-        policy_abbrs = ['TCJA']  # Default
+        # Load all policies from file
+        if os.path.exists(POLICIES_FILE):
+            policies_df = pd.read_csv(POLICIES_FILE)
+            policy_abbrs = policies_df['policy_abbreviation'].tolist()
+        else:
+            policy_abbrs = ['TCJA', 'ACA', 'NCLB']  # Default
 
     print(f"\nPolicies to process: {policy_abbrs}")
 
@@ -945,9 +1090,14 @@ def main():
         crossref = result['abstracts_from_crossref']
         openaccess = result['abstracts_from_openaccess']
         ssrn = result['abstracts_from_ssrn']
-        total = result['total_papers']
-        final = result['final_with_abstract']
-        print(f"  {abbr}: CrossRef={crossref}, OpenAccess={openaccess}, SSRN={ssrn} recovered, {final}/{total} now have abstracts")
+        initial = result['initial_papers']
+        final = result['final_papers']
+        final_with_abs = result['final_with_abstract']
+        filtered = result['relevance_filter']['filtered_with_abstract']
+        print(f"  {abbr}:")
+        print(f"    Recovered: CrossRef={crossref}, OpenAccess={openaccess}, SSRN={ssrn}")
+        print(f"    Filtered out (no search term match): {filtered}")
+        print(f"    Final: {final} papers ({final_with_abs} with abstracts)")
 
     print(f"\n{'='*80}")
     print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
