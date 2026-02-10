@@ -11,10 +11,10 @@ Pipeline Overview:
 1. Load policy configurations from ../get_policies/output/policies.csv
 2. For each policy, search Semantic Scholar using ALL search terms (pipe-separated in CSV)
 3. Extract paper metadata (title, authors, abstract, year, etc.)
-4. Deduplicate results across all search terms
+4. Deduplicate results, tracking ALL search terms that found each paper
 5. Filter papers by publication date (must be >= policy year)
-6. Compare with OpenAlex and NBER results to check coverage
-7. Save results and comparison report
+6. Save RAW results (no relevance filtering) to Parquet/CSV
+7. Compare with OpenAlex and NBER results to check coverage
 
 Key Implementation Notes:
 -------------------------
@@ -22,16 +22,30 @@ Key Implementation Notes:
 - Searches all search terms from policies.csv.
 - Title normalization is used for deduplication and matching papers between sources.
 - Papers published before the policy year are filtered out.
-- Semantic Scholar API: GET https://api.semanticscholar.org/graph/v1/paper/search
+- Semantic Scholar API: GET https://api.semanticscholar.org/graph/v1/paper/search/bulk
+- Uses bulk search endpoint (/paper/search/bulk) with token-based pagination (no 10K cap)
 - API key required: Set SEMANTIC_SCHOLAR_API_KEY environment variable
-- Rate limit: 1 request per second (we use 1.1s delay to stay safely under)
+- Rate limit: 1 request per second (enforced by thread-safe RateLimiter)
+- Search terms are processed in parallel using ThreadPoolExecutor (MAX_WORKERS=2 due to strict rate limits)
+- NO relevance filtering at this stage - filtering happens after abstract recovery.
+- Tracks ALL search terms that found each paper (pipe-separated in search_terms_matched column).
+
+Output Files:
+-------------
+- {abbr}_papers_semantic_scholar_raw.parquet: Raw dataset (efficient storage)
+- {abbr}_papers_semantic_scholar_raw.csv: Raw dataset (compatibility)
+- {abbr}_semantic_scholar_metadata.json: Scraping metadata and statistics
 
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
 Updated: January 27, 2026 - Increased max_results to 1500, added relevance filtering
+Updated: February 4, 2026 - Increased max_results to 10000, consistent config
+Updated: February 4, 2026 - Removed relevance filtering, track all search terms, save raw data
+Updated: February 6, 2026 - Switch to bulk API (no 10K cap), parallelize search terms with ThreadPoolExecutor
 """
 
 import requests
+import argparse
 import json
 import pandas as pd
 import time
@@ -40,14 +54,16 @@ from datetime import datetime
 import os
 import sys
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Load environment variables from .env file
 # Look for .env in the repo root (three levels up from this script)
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 load_dotenv(os.path.join(REPO_ROOT, ".env"))
 
-# Semantic Scholar API configuration
-SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search"
+# Semantic Scholar API configuration (bulk endpoint for token-based pagination, no 10K cap)
+SEMANTIC_SCHOLAR_API = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
 SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
 
 if not SEMANTIC_SCHOLAR_API_KEY:
@@ -58,8 +74,13 @@ if not SEMANTIC_SCHOLAR_API_KEY:
 # Fields to request from API
 API_FIELDS = "paperId,title,abstract,authors,year,citationCount,venue,publicationDate,isOpenAccess,openAccessPdf"
 
-# Rate limit: 1 request per second (use 1.1s to stay safely under)
-RATE_LIMIT_DELAY = 1.1
+# =============================================================================
+# SCRAPING CONFIGURATION - Keep consistent across all scrapers
+# =============================================================================
+MAX_RESULTS_PER_TERM = None   # No limit with token-based bulk pagination
+PER_PAGE = 1000               # Results per API page (bulk endpoint allows up to 1000)
+RATE_LIMIT_DELAY = 1.1        # Seconds between API requests (strict for SS)
+MAX_WORKERS = 2               # Conservative due to SS strict rate limits
 
 # Output paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +101,25 @@ NBER_OUTPUT_DIR = os.path.normpath(NBER_OUTPUT_DIR)
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
+
+
+class RateLimiter:
+    """Thread-safe rate limiter for API requests."""
+    def __init__(self, delay):
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.last_request = 0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_request
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self.last_request = time.time()
+
+
+rate_limiter = RateLimiter(RATE_LIMIT_DELAY)
 
 
 def load_policies(policies_file):
@@ -122,20 +162,21 @@ def load_policies(policies_file):
     return df
 
 
-def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
+def search_semantic_scholar(query, limit=PER_PAGE, max_results=MAX_RESULTS_PER_TERM, max_retries=3):
     """
     Search Semantic Scholar for papers matching the query.
 
-    Uses the Semantic Scholar Academic Graph API.
+    Uses the Semantic Scholar bulk search endpoint with token-based pagination
+    (no 10,000 result cap unlike the standard search endpoint).
 
     Parameters:
     -----------
     query : str
         Search query string
     limit : int
-        Number of results per page (max 100)
-    max_results : int
-        Maximum total number of results to retrieve
+        Number of results per page (bulk endpoint allows up to 1000)
+    max_results : int or None
+        Maximum total number of results to retrieve (None for no limit)
     max_retries : int
         Maximum number of retries for rate limit errors
 
@@ -144,7 +185,7 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
     list : List of paper dictionaries from Semantic Scholar API
     """
     all_results = []
-    offset = 0
+    continuation_token = None
 
     print(f"  Searching Semantic Scholar for: '{query}'")
 
@@ -153,17 +194,25 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
     if SEMANTIC_SCHOLAR_API_KEY:
         headers['x-api-key'] = SEMANTIC_SCHOLAR_API_KEY
 
-    while len(all_results) < max_results:
+    while True:
+        # Check max_results limit
+        if max_results is not None and len(all_results) >= max_results:
+            break
+
         params = {
             'query': query,
             'fields': API_FIELDS,
-            'offset': offset,
             'limit': limit
         }
+
+        # Add continuation token for subsequent pages
+        if continuation_token is not None:
+            params['token'] = continuation_token
 
         # Retry logic for rate limit errors
         for retry in range(max_retries):
             try:
+                rate_limiter.wait()
                 response = requests.get(SEMANTIC_SCHOLAR_API, params=params, headers=headers)
 
                 # Handle rate limit (429) with exponential backoff
@@ -178,19 +227,23 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
 
                 results = data.get('data', [])
                 if not results:
-                    print(f"    No more results at offset {offset}")
-                    return all_results[:max_results]
+                    print(f"    No more results (fetched {len(all_results)} total)")
+                    if max_results is not None:
+                        return all_results[:max_results]
+                    return all_results
 
                 all_results.extend(results)
                 total = data.get('total', 0)
-                print(f"    Offset {offset}: {len(results)} results (total: {len(all_results)}/{total})")
+                print(f"    Page: {len(results)} results (total: {len(all_results)}/{total})")
 
-                # Check if we've reached the end
-                if offset + limit >= total:
-                    return all_results[:max_results]
+                # Get continuation token for next page
+                continuation_token = data.get('token')
+                if continuation_token is None:
+                    # No more pages
+                    if max_results is not None:
+                        return all_results[:max_results]
+                    return all_results
 
-                offset += limit
-                time.sleep(RATE_LIMIT_DELAY)  # Respect rate limit: 1 req/sec
                 break  # Success, exit retry loop
 
             except requests.exceptions.RequestException as e:
@@ -199,10 +252,14 @@ def search_semantic_scholar(query, limit=100, max_results=1000, max_retries=3):
                     print(f"    ERROR: {e}. Waiting {wait_time}s before retry {retry + 1}/{max_retries}...")
                     time.sleep(wait_time)
                 else:
-                    print(f"    ERROR retrieving offset {offset}: {e}")
-                    return all_results[:max_results]
+                    print(f"    ERROR retrieving results: {e}")
+                    if max_results is not None:
+                        return all_results[:max_results]
+                    return all_results
 
-    return all_results[:max_results]
+    if max_results is not None:
+        return all_results[:max_results]
+    return all_results
 
 
 def extract_paper_info(paper):
@@ -269,51 +326,6 @@ def normalize_title(title):
     return title
 
 
-def filter_by_relevance(df, search_terms):
-    """
-    Filter papers by relevance based on search term presence in title/abstract.
-
-    Logic:
-    - If paper has title AND abstract: keep only if at least one search term
-      appears in either title or abstract (case-insensitive)
-    - If paper has only title (no abstract): keep the paper
-
-    Parameters:
-    -----------
-    df : pd.DataFrame
-        DataFrame with 'title' and 'abstract' columns
-    search_terms : list
-        List of search terms to look for
-
-    Returns:
-    --------
-    pd.DataFrame : Filtered DataFrame with only relevant papers
-    """
-    if len(df) == 0:
-        return df
-
-    def is_relevant(row):
-        title = str(row.get('title', '')).lower()
-        abstract = str(row.get('abstract', '')).lower()
-
-        # If no abstract, keep the paper (we'll filter again after complementing)
-        if not abstract or abstract == 'nan' or abstract == '' or abstract == 'none':
-            return True
-
-        # If we have both title and abstract, check for search term presence
-        text = title + ' ' + abstract
-        for term in search_terms:
-            term_lower = term.lower()
-            if term_lower in text:
-                return True
-
-        return False
-
-    # Apply filter
-    mask = df.apply(is_relevant, axis=1)
-    return df[mask].copy()
-
-
 def compare_with_openalex(policy_abbr):
     """
     Compare Semantic Scholar papers with OpenAlex coverage.
@@ -329,8 +341,12 @@ def compare_with_openalex(policy_abbr):
     """
     print(f"\n  Comparing Semantic Scholar vs OpenAlex for {policy_abbr}...")
 
-    # Load Semantic Scholar papers
-    ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
+    # Load Semantic Scholar papers (try raw first, then regular)
+    ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.parquet")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.csv")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
     if not os.path.exists(ss_file):
         ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.csv")
 
@@ -343,8 +359,12 @@ def compare_with_openalex(policy_abbr):
     else:
         ss_df = pd.read_csv(ss_file)
 
-    # Load OpenAlex papers
-    openalex_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
+    # Load OpenAlex papers (try raw first, then regular)
+    openalex_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.parquet")
+    if not os.path.exists(openalex_file):
+        openalex_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.csv")
+    if not os.path.exists(openalex_file):
+        openalex_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
     if not os.path.exists(openalex_file):
         openalex_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
 
@@ -416,8 +436,12 @@ def compare_with_nber(policy_abbr):
     """
     print(f"\n  Comparing Semantic Scholar vs NBER for {policy_abbr}...")
 
-    # Load Semantic Scholar papers
-    ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
+    # Load Semantic Scholar papers (try raw first, then regular)
+    ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.parquet")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.csv")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
     if not os.path.exists(ss_file):
         ss_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.csv")
 
@@ -430,8 +454,12 @@ def compare_with_nber(policy_abbr):
     else:
         ss_df = pd.read_csv(ss_file)
 
-    # Load NBER papers
-    nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber.parquet")
+    # Load NBER papers (try raw first, then regular)
+    nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber_raw.parquet")
+    if not os.path.exists(nber_file):
+        nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber_raw.csv")
+    if not os.path.exists(nber_file):
+        nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber.parquet")
     if not os.path.exists(nber_file):
         nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber.csv")
 
@@ -466,6 +494,13 @@ def compare_with_nber(policy_abbr):
     print(f"    Semantic Scholar papers also in NBER: {ss_in_nber} ({100*ss_in_nber/len(ss_df):.1f}%)")
     print(f"    NBER papers also in Semantic Scholar: {nber_in_ss} ({100*nber_in_ss/len(nber_df):.1f}%)")
 
+    # Show NBER papers NOT in Semantic Scholar (important for coverage analysis)
+    nber_not_in_ss = nber_df[~nber_df['in_semantic_scholar']]
+    if len(nber_not_in_ss) > 0:
+        print(f"    WARNING: {len(nber_not_in_ss)} NBER papers NOT in Semantic Scholar:")
+        for _, row in nber_not_in_ss.head(5).iterrows():
+            print(f"      - {row['title'][:60]}...")
+
     # Save with indicators
     ss_nber_indicator_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_semantic_scholar_nber_indicator.csv")
     ss_df.to_csv(ss_nber_indicator_file, index=False)
@@ -482,7 +517,8 @@ def compare_with_nber(policy_abbr):
         'ss_in_nber': int(ss_in_nber),
         'ss_in_nber_pct': 100 * ss_in_nber / len(ss_df) if len(ss_df) > 0 else 0,
         'nber_in_ss': int(nber_in_ss),
-        'nber_in_ss_pct': 100 * nber_in_ss / len(nber_df) if len(nber_df) > 0 else 0
+        'nber_in_ss_pct': 100 * nber_in_ss / len(nber_df) if len(nber_df) > 0 else 0,
+        'nber_missing_from_ss': len(nber_not_in_ss)
     }
 
 
@@ -516,10 +552,11 @@ def process_policy(policy_row):
 
     all_papers = []
     search_metadata = []
+    results_lock = threading.Lock()
 
-    # Search for each term
-    for term in search_terms:
-        results = search_semantic_scholar(term, limit=100, max_results=1500)
+    def search_single_term(term):
+        """Search for a single term and return results with metadata."""
+        results = search_semantic_scholar(term, limit=PER_PAGE, max_results=MAX_RESULTS_PER_TERM)
 
         # Save raw results for this term
         safe_term = term.replace(' ', '_').replace('/', '_').lower()
@@ -529,6 +566,7 @@ def process_policy(policy_row):
         print(f"    Saved raw results to: {raw_file}")
 
         # Extract paper info
+        papers = []
         for paper in results:
             paper_info = extract_paper_info(paper)
             paper_info['search_term'] = term
@@ -537,18 +575,31 @@ def process_policy(policy_row):
             paper_info['policy_abbreviation'] = policy_abbr
             paper_info['policy_category'] = policy_category
             paper_info['scrape_date'] = datetime.now().strftime('%Y-%m-%d')
-            all_papers.append(paper_info)
+            papers.append(paper_info)
 
-        search_metadata.append({
+        metadata = {
             'search_term': term,
             'results_count': len(results),
             'timestamp': datetime.now().isoformat()
-        })
+        }
 
-        print(f"    Extracted info from {len(results)} papers")
+        print(f"    Extracted info from {len(results)} papers for '{term}'")
+        return papers, metadata
 
-        # Delay between search terms to respect rate limit
-        time.sleep(RATE_LIMIT_DELAY)
+    # Search for each term in parallel
+    print(f"\n  Searching {len(search_terms)} terms in parallel (max {MAX_WORKERS} workers)...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_term = {executor.submit(search_single_term, term): term for term in search_terms}
+
+        for future in as_completed(future_to_term):
+            term = future_to_term[future]
+            try:
+                papers, metadata = future.result()
+                with results_lock:
+                    all_papers.extend(papers)
+                    search_metadata.append(metadata)
+            except Exception as e:
+                print(f"    ERROR processing term '{term}': {e}")
 
     # Create DataFrame
     df = pd.DataFrame(all_papers)
@@ -561,15 +612,26 @@ def process_policy(policy_row):
             'total_papers': 0,
             'duplicates_removed': 0,
             'pre_policy_filtered': 0,
-            'unique_papers': 0
+            'unique_papers_raw': 0
         }
 
     initial_count = len(df)
     print(f"\n  Total papers found: {initial_count}")
 
-    # Remove duplicates (based on Semantic Scholar ID)
-    print(f"\n  Removing duplicates...")
-    df_unique = df.drop_duplicates(subset=['semantic_scholar_id'], keep='first')
+    # Aggregate all search terms for each paper (instead of keeping just the first)
+    print(f"\n  Aggregating search terms and removing duplicates...")
+    search_terms_agg = df.groupby('semantic_scholar_id')['search_term'].apply(
+        lambda x: ' | '.join(sorted(set(x)))
+    ).reset_index()
+    search_terms_agg.columns = ['semantic_scholar_id', 'search_terms_matched']
+
+    # Keep first occurrence of each paper (for other columns)
+    df_unique = df.drop_duplicates(subset=['semantic_scholar_id'], keep='first').copy()
+
+    # Merge aggregated search terms
+    df_unique = df_unique.drop(columns=['search_term'])
+    df_unique = df_unique.merge(search_terms_agg, on='semantic_scholar_id', how='left')
+
     duplicate_count = initial_count - len(df_unique)
     print(f"    Initial: {initial_count} | Duplicates: {duplicate_count} | Unique: {len(df_unique)}")
 
@@ -584,35 +646,30 @@ def process_policy(policy_row):
     filtered_count = pre_filter_count - len(df_unique)
     print(f"    Before filter: {pre_filter_count} | Filtered out: {filtered_count} | After filter: {len(df_unique)}")
 
-    # Filter by relevance (search terms in title/abstract)
-    print(f"\n  Filtering by relevance (search terms in title/abstract)...")
-    pre_relevance_count = len(df_unique)
-    df_unique = filter_by_relevance(df_unique, search_terms)
-    relevance_filtered = pre_relevance_count - len(df_unique)
-    print(f"    Before filter: {pre_relevance_count} | Filtered out: {relevance_filtered} | After filter: {len(df_unique)}")
+    # NO relevance filtering at scrape stage - will be done after abstract recovery
+    print(f"\n  Skipping relevance filtering (will be applied after abstract recovery)")
 
     # Add normalized title for comparison
-    df_unique = df_unique.copy()
     df_unique['normalized_title'] = df_unique['title'].apply(normalize_title)
 
-    # Reorder columns
+    # Reorder columns (search_terms_matched contains all matched terms)
     column_order = [
         'semantic_scholar_id', 'title', 'authors', 'author_count',
         'publication_year', 'publication_date', 'abstract', 'venue',
         'cited_by_count', 'is_open_access', 'open_access_url',
-        'search_term', 'policy_studied', 'policy_year', 'policy_abbreviation',
+        'search_terms_matched', 'policy_studied', 'policy_year', 'policy_abbreviation',
         'policy_category', 'data_source', 'scrape_date', 'normalized_title'
     ]
     df_unique = df_unique[[c for c in column_order if c in df_unique.columns]]
 
-    # Save outputs
-    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
+    # Save RAW outputs (no relevance filtering applied)
+    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.parquet")
     df_unique.to_parquet(parquet_file, index=False, engine='pyarrow')
-    print(f"\n  Saved Parquet: {parquet_file}")
+    print(f"\n  Saved RAW Parquet: {parquet_file}")
 
-    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.csv")
+    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.csv")
     df_unique.to_csv(csv_file, index=False, encoding='utf-8')
-    print(f"  Saved CSV: {csv_file}")
+    print(f"  Saved RAW CSV: {csv_file}")
 
     # Save metadata
     metadata = {
@@ -625,8 +682,8 @@ def process_policy(policy_row):
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
-        'relevance_filtered': relevance_filtered,
-        'unique_papers': len(df_unique),
+        'unique_papers_raw': len(df_unique),
+        'note': 'Raw data without relevance filtering. Filtering applied after abstract recovery.',
         'search_details': search_metadata
     }
 
@@ -636,8 +693,8 @@ def process_policy(policy_row):
     print(f"  Saved metadata: {metadata_file}")
 
     # Summary
-    print(f"\n  SUMMARY for {policy_abbr}:")
-    print(f"    Unique papers: {len(df_unique)}")
+    print(f"\n  SUMMARY for {policy_abbr} (RAW DATA):")
+    print(f"    Unique papers (raw): {len(df_unique)}")
     if len(df_unique) > 0 and df_unique['publication_year'].notna().any():
         years = df_unique['publication_year'].dropna()
         print(f"    Date range: {int(years.min())}-{int(years.max())}")
@@ -650,23 +707,46 @@ def process_policy(policy_row):
         'total_papers': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
-        'relevance_filtered': relevance_filtered,
-        'unique_papers': len(df_unique)
+        'unique_papers_raw': len(df_unique)
     }
+
+
+def is_policy_complete(policy_abbr, source_name):
+    """Check if a policy was already completed today (for --resume mode)."""
+    metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_{source_name}_metadata.json")
+    if not os.path.exists(metadata_file):
+        return False
+    mod_time = datetime.fromtimestamp(os.path.getmtime(metadata_file))
+    return mod_time.date() == datetime.now().date()
 
 
 def main():
     """
     Main execution function
     """
+    parser = argparse.ArgumentParser(description="Semantic Scholar paper scraping and comparison")
+    parser.add_argument('policies', nargs='*', help='Policy abbreviations to process (default: all)')
+    parser.add_argument('--resume', action='store_true', help='Skip policies already completed today')
+    args = parser.parse_args()
+
     print("="*80)
     print("SEMANTIC SCHOLAR PAPER SCRAPING AND COMPARISON")
     print("="*80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.resume:
+        print("  Mode: RESUME (skipping policies completed today)")
     print()
 
     # Load policies configuration
     policies_df = load_policies(POLICIES_FILE)
+
+    # Filter to requested policies if specified
+    if args.policies:
+        policies_df = policies_df[policies_df['policy_abbreviation'].isin(args.policies)]
+        if policies_df.empty:
+            print(f"ERROR: No matching policies found for {args.policies}")
+            return
+
     print(f"\nPolicies to process:")
     for _, row in policies_df.iterrows():
         print(f"  - {row['policy_name']} ({row['policy_abbreviation']})")
@@ -674,6 +754,13 @@ def main():
     # Process each policy
     all_summaries = []
     for idx, row in policies_df.iterrows():
+        policy_abbr = row['policy_abbreviation']
+
+        # Check checkpoint in resume mode
+        if args.resume and is_policy_complete(policy_abbr, 'semantic_scholar'):
+            print(f"\n  SKIP {row['policy_name']} — already completed today (--resume)")
+            continue
+
         try:
             summary = process_policy(row)
             all_summaries.append(summary)
@@ -747,13 +834,16 @@ def main():
     print("OVERALL SUMMARY")
     print(f"{'='*80}")
 
-    summary_df = pd.DataFrame(all_summaries)
-    print(summary_df.to_string(index=False))
+    if all_summaries:
+        summary_df = pd.DataFrame(all_summaries)
+        print(summary_df.to_string(index=False))
 
-    # Save overall summary
-    summary_file = os.path.join(OUTPUT_DIR, "semantic_scholar_scrape_summary.csv")
-    summary_df.to_csv(summary_file, index=False)
-    print(f"\nSaved overall summary: {summary_file}")
+        # Save overall summary
+        summary_file = os.path.join(OUTPUT_DIR, "semantic_scholar_scrape_summary.csv")
+        summary_df.to_csv(summary_file, index=False)
+        print(f"\nSaved overall summary: {summary_file}")
+    else:
+        print("  No policies were processed (all skipped or failed).")
 
     # Print comparison results
     if openalex_comparison_results:
@@ -777,6 +867,8 @@ def main():
             print(f"  NBER papers: {result['nber_total']}")
             print(f"  SS in NBER: {result['ss_in_nber']} ({result['ss_in_nber_pct']:.1f}%)")
             print(f"  NBER in SS: {result['nber_in_ss']} ({result['nber_in_ss_pct']:.1f}%)")
+            if result.get('nber_missing_from_ss', 0) > 0:
+                print(f"  *** {result['nber_missing_from_ss']} NBER papers MISSING from Semantic Scholar ***")
 
     print(f"\n{'='*80}")
     print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

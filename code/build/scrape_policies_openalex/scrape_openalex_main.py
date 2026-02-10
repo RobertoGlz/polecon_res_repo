@@ -9,9 +9,10 @@ searches OpenAlex for academic papers related to each policy.
 Pipeline Overview:
 ------------------
 1. Load policy configurations from ../get_policies/output/policies.csv
-2. For each policy, search OpenAlex using configured search terms
+2. For each policy, search OpenAlex using configured search terms (in parallel)
 3. Extract paper metadata (title, authors, abstract, citations, etc.)
-4. Deduplicate results and save to Parquet/CSV formats
+4. Deduplicate results, tracking ALL search terms that found each paper
+5. Save RAW results (no relevance filtering) to Parquet/CSV formats
 
 Key Implementation Notes:
 -------------------------
@@ -19,13 +20,25 @@ Key Implementation Notes:
   not plain text. The reconstruct_abstract() function handles this conversion.
 - Uses OpenAlex "polite pool" (via mailto parameter) for better rate limits.
 - Raw API responses are saved to tmp/ for debugging and reproducibility.
+- Search terms are processed in parallel using ThreadPoolExecutor for speed.
+- NO relevance filtering at this stage - filtering happens after abstract recovery.
+- Tracks ALL search terms that found each paper (pipe-separated in search_terms column).
+
+Output Files:
+-------------
+- {abbr}_papers_openalex_raw.parquet: Raw dataset (efficient storage)
+- {abbr}_papers_openalex_raw.csv: Raw dataset (compatibility)
+- {abbr}_openalex_metadata.json: Scraping metadata and statistics
 
 Author: claude ai with modifications by roberto gonzalez
 Date: January 9, 2026
 Updated: January 14, 2026 - Fixed abstract extraction from inverted index
 Updated: January 27, 2026 - Increased max_results to 1500, added relevance filtering
+Updated: February 4, 2026 - Increased max_results to 10000, added parallel processing
+Updated: February 4, 2026 - Removed relevance filtering, track all search terms, save raw data
 """
 
+import argparse
 import requests
 import json
 import pandas as pd
@@ -34,12 +47,40 @@ from datetime import datetime
 import os
 import sys
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # OpenAlex API endpoint
 OPENALEX_API = "https://api.openalex.org/works"
 
 # User email for OpenAlex polite pool - REPLACE WITH YOUR EMAIL
 USER_EMAIL = "rob98@stanford.edu"
+
+# =============================================================================
+# SCRAPING CONFIGURATION - Keep consistent across all scrapers
+# =============================================================================
+MAX_RESULTS_PER_TERM = None   # No limit - use cursor pagination to get all results
+PER_PAGE = 200                # Results per API page (max 200 for OpenAlex)
+RATE_LIMIT_DELAY = 0.1        # Seconds between API requests
+MAX_WORKERS = 3               # Number of parallel threads for search terms
+
+# Thread-safe rate limiter for parallel requests
+class RateLimiter:
+    """Thread-safe rate limiter for API requests."""
+    def __init__(self, delay):
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.last_request = 0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_request
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self.last_request = time.time()
+
+rate_limiter = RateLimiter(RATE_LIMIT_DELAY)
 
 # Output paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +90,13 @@ TMP_DIR = os.path.join(SCRIPT_DIR, "tmp")
 # Policies file location: ../get_policies/output/policies.csv
 POLICIES_FILE = os.path.join(SCRIPT_DIR, "..", "get_policies", "output", "policies.csv")
 POLICIES_FILE = os.path.normpath(POLICIES_FILE)
+
+# NBER and Semantic Scholar output for comparison
+NBER_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "scrape_policies_nber", "output")
+NBER_OUTPUT_DIR = os.path.normpath(NBER_OUTPUT_DIR)
+
+SEMANTIC_SCHOLAR_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "scrape_policies_semantic_scholar", "output")
+SEMANTIC_SCHOLAR_OUTPUT_DIR = os.path.normpath(SEMANTIC_SCHOLAR_OUTPUT_DIR)
 
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -149,13 +197,14 @@ def load_policies(policies_file):
     return df
 
 
-def search_openalex(query, per_page=100, max_results=1000):
+def search_openalex(query, per_page=PER_PAGE, max_results=MAX_RESULTS_PER_TERM):
     """
-    Search OpenAlex for papers matching the query.
+    Search OpenAlex for papers matching the query using cursor-based pagination.
 
     Uses the OpenAlex Works API to search for academic papers. The API
     supports full-text search across titles, abstracts, and full text.
-    Results are paginated, and this function handles pagination automatically.
+    Uses cursor-based pagination (no result cap), unlike page-based
+    pagination which is limited to 10,000 results.
 
     API Documentation: https://docs.openalex.org/api-entities/works
 
@@ -165,8 +214,9 @@ def search_openalex(query, per_page=100, max_results=1000):
         Search query string (searches title, abstract, and full text)
     per_page : int
         Number of results per page (max 200 per OpenAlex limits)
-    max_results : int
-        Maximum total number of results to retrieve across all pages
+    max_results : int or None
+        Maximum total number of results to retrieve. None means no limit
+        (retrieve all available results).
 
     Returns:
     --------
@@ -174,50 +224,65 @@ def search_openalex(query, per_page=100, max_results=1000):
 
     Notes:
     ------
+    - Uses cursor-based pagination ('cursor' parameter) for unlimited results
     - Uses the 'mailto' parameter for polite pool access (faster rate limits)
-    - Includes 0.1s delay between requests to avoid rate limiting
+    - Uses thread-safe rate limiter for parallel processing
     - Stops early if no more results are available
     """
     all_results = []
-    page = 1
+    cursor = '*'  # Initial cursor value for first request
+    batch_num = 0
 
     print(f"  Searching OpenAlex for: '{query}'")
-    
-    while len(all_results) < max_results:
-        # OpenAlex API parameters
+
+    while True:
+        # Check max_results limit
+        if max_results is not None and len(all_results) >= max_results:
+            break
+
+        # OpenAlex API parameters with cursor pagination
         params = {
             'search': query,
             'per_page': per_page,
-            'page': page,
+            'cursor': cursor,
             'mailto': USER_EMAIL
         }
-        
+
         try:
+            rate_limiter.wait()  # Thread-safe rate limiting
             response = requests.get(OPENALEX_API, params=params)
             response.raise_for_status()
             data = response.json()
-            
+
             results = data.get('results', [])
             if not results:
-                print(f"    No more results at page {page}")
+                print(f"    [{query[:30]}...] No more results after {len(all_results)} total")
                 break
-            
+
             all_results.extend(results)
-            print(f"    Page {page}: {len(results)} results (total: {len(all_results)})")
-            
-            # Check if we've reached the end
+            batch_num += 1
+
+            # Print progress every 5 batches or on first batch
             meta = data.get('meta', {})
-            if page >= meta.get('count', 0) // per_page + 1:
+            total_available = meta.get('count', '?')
+            if batch_num <= 2 or batch_num % 5 == 0:
+                print(f"    [{query[:30]}...] Batch {batch_num}: {len(results)} results "
+                      f"(total: {len(all_results)}/{total_available})")
+
+            # Get next cursor for pagination
+            next_cursor = meta.get('next_cursor')
+            if not next_cursor:
+                print(f"    [{query[:30]}...] Reached end at {len(all_results)} results")
                 break
-            
-            page += 1
-            time.sleep(0.1)  # Be polite to the API
-            
+            cursor = next_cursor
+
         except requests.exceptions.RequestException as e:
-            print(f"    ERROR retrieving page {page}: {e}")
+            print(f"    [{query[:30]}...] ERROR at batch {batch_num + 1}: {e}")
             break
-    
-    return all_results[:max_results]
+
+    if max_results is not None:
+        return all_results[:max_results]
+    return all_results
 
 
 def extract_paper_info(work):
@@ -311,50 +376,215 @@ def extract_paper_info(work):
     return paper_info
 
 
-def filter_by_relevance(df, search_terms):
+def normalize_title(title):
     """
-    Filter papers by relevance based on search term presence in title/abstract.
-
-    Logic:
-    - If paper has title AND abstract: keep only if at least one search term
-      appears in either title or abstract (case-insensitive)
-    - If paper has only title (no abstract): keep the paper
+    Normalize title for comparison.
 
     Parameters:
     -----------
-    df : pd.DataFrame
-        DataFrame with 'title' and 'abstract' columns
-    search_terms : list
-        List of search terms to look for
+    title : str
+        Paper title
 
     Returns:
     --------
-    pd.DataFrame : Filtered DataFrame with only relevant papers
+    str : Normalized title (lowercase, no punctuation, normalized whitespace)
     """
-    if len(df) == 0:
-        return df
+    if not title or pd.isna(title):
+        return ''
+    title = str(title).lower()
+    title = re.sub(r'[^\w\s]', '', title)  # Remove punctuation
+    title = ' '.join(title.split())  # Normalize whitespace
+    return title
 
-    def is_relevant(row):
-        title = str(row.get('title', '')).lower()
-        abstract = str(row.get('abstract', '')).lower()
 
-        # If no abstract, keep the paper (we'll filter again after complementing)
-        if not abstract or abstract == 'nan' or abstract == '':
-            return True
+def compare_with_nber(policy_abbr):
+    """
+    Compare OpenAlex papers with NBER coverage.
 
-        # If we have both title and abstract, check for search term presence
-        text = title + ' ' + abstract
-        for term in search_terms:
-            # Use word boundary matching for better precision
-            term_lower = term.lower()
-            if term_lower in text:
-                return True
+    Parameters:
+    -----------
+    policy_abbr : str
+        Policy abbreviation (e.g., "TCJA")
 
-        return False
+    Returns:
+    --------
+    dict : Comparison statistics
+    """
+    print(f"\n  Comparing OpenAlex vs NBER for {policy_abbr}...")
 
-    # Apply filter
-    mask = df.apply(is_relevant, axis=1)
-    return df[mask].copy()
+    # Load OpenAlex papers (try raw first, then regular)
+    oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.parquet")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.csv")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
+
+    if not os.path.exists(oa_file):
+        print(f"    ERROR: OpenAlex file not found for {policy_abbr}")
+        return None
+
+    if oa_file.endswith('.parquet'):
+        oa_df = pd.read_parquet(oa_file)
+    else:
+        oa_df = pd.read_csv(oa_file)
+
+    # Load NBER papers (try raw first, then regular)
+    nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber_raw.parquet")
+    if not os.path.exists(nber_file):
+        nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber_raw.csv")
+    if not os.path.exists(nber_file):
+        nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber.parquet")
+    if not os.path.exists(nber_file):
+        nber_file = os.path.join(NBER_OUTPUT_DIR, f"{policy_abbr}_papers_nber.csv")
+
+    if not os.path.exists(nber_file):
+        print(f"    ERROR: NBER file not found for {policy_abbr}")
+        return None
+
+    if nber_file.endswith('.parquet'):
+        nber_df = pd.read_parquet(nber_file)
+    else:
+        nber_df = pd.read_csv(nber_file)
+
+    print(f"    OpenAlex papers: {len(oa_df)}")
+    print(f"    NBER papers: {len(nber_df)}")
+
+    # Normalize titles for matching
+    oa_df['normalized_title'] = oa_df['title'].apply(normalize_title)
+    nber_df['normalized_title'] = nber_df['title'].apply(normalize_title)
+
+    # Create sets for fast lookup
+    oa_titles = set(oa_df['normalized_title'].dropna())
+    nber_titles = set(nber_df['normalized_title'].dropna())
+
+    # Add indicators
+    oa_df['in_nber'] = oa_df['normalized_title'].isin(nber_titles)
+    nber_df['in_openalex'] = nber_df['normalized_title'].isin(oa_titles)
+
+    # Calculate statistics
+    oa_in_nber = oa_df['in_nber'].sum()
+    nber_in_oa = nber_df['in_openalex'].sum()
+
+    print(f"    OpenAlex papers also in NBER: {oa_in_nber} ({100*oa_in_nber/len(oa_df):.1f}%)")
+    print(f"    NBER papers also in OpenAlex: {nber_in_oa} ({100*nber_in_oa/len(nber_df):.1f}%)")
+
+    # Show NBER papers NOT in OpenAlex (important for coverage analysis)
+    nber_not_in_oa = nber_df[~nber_df['in_openalex']]
+    if len(nber_not_in_oa) > 0:
+        print(f"    WARNING: {len(nber_not_in_oa)} NBER papers NOT in OpenAlex:")
+        for _, row in nber_not_in_oa.head(5).iterrows():
+            print(f"      - {row['title'][:60]}...")
+
+    # Save with indicators
+    oa_indicator_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_openalex_nber_indicator.csv")
+    oa_df.to_csv(oa_indicator_file, index=False)
+    print(f"    Saved: {oa_indicator_file}")
+
+    nber_indicator_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_nber_openalex_indicator.csv")
+    nber_df.to_csv(nber_indicator_file, index=False)
+    print(f"    Saved: {nber_indicator_file}")
+
+    return {
+        'policy_abbr': policy_abbr,
+        'openalex_total': len(oa_df),
+        'nber_total': len(nber_df),
+        'oa_in_nber': int(oa_in_nber),
+        'oa_in_nber_pct': 100 * oa_in_nber / len(oa_df) if len(oa_df) > 0 else 0,
+        'nber_in_oa': int(nber_in_oa),
+        'nber_in_oa_pct': 100 * nber_in_oa / len(nber_df) if len(nber_df) > 0 else 0,
+        'nber_missing_from_oa': len(nber_not_in_oa)
+    }
+
+
+def compare_with_semantic_scholar(policy_abbr):
+    """
+    Compare OpenAlex papers with Semantic Scholar coverage.
+
+    Parameters:
+    -----------
+    policy_abbr : str
+        Policy abbreviation (e.g., "TCJA")
+
+    Returns:
+    --------
+    dict : Comparison statistics
+    """
+    print(f"\n  Comparing OpenAlex vs Semantic Scholar for {policy_abbr}...")
+
+    # Load OpenAlex papers (try raw first, then regular)
+    oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.parquet")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.csv")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
+    if not os.path.exists(oa_file):
+        oa_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
+
+    if not os.path.exists(oa_file):
+        print(f"    ERROR: OpenAlex file not found for {policy_abbr}")
+        return None
+
+    if oa_file.endswith('.parquet'):
+        oa_df = pd.read_parquet(oa_file)
+    else:
+        oa_df = pd.read_csv(oa_file)
+
+    # Load Semantic Scholar papers (try raw first, then regular)
+    ss_file = os.path.join(SEMANTIC_SCHOLAR_OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.parquet")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(SEMANTIC_SCHOLAR_OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar_raw.csv")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(SEMANTIC_SCHOLAR_OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.parquet")
+    if not os.path.exists(ss_file):
+        ss_file = os.path.join(SEMANTIC_SCHOLAR_OUTPUT_DIR, f"{policy_abbr}_papers_semantic_scholar.csv")
+
+    if not os.path.exists(ss_file):
+        print(f"    ERROR: Semantic Scholar file not found for {policy_abbr}")
+        return None
+
+    if ss_file.endswith('.parquet'):
+        ss_df = pd.read_parquet(ss_file)
+    else:
+        ss_df = pd.read_csv(ss_file)
+
+    print(f"    OpenAlex papers: {len(oa_df)}")
+    print(f"    Semantic Scholar papers: {len(ss_df)}")
+
+    # Normalize titles for matching
+    oa_df['normalized_title'] = oa_df['title'].apply(normalize_title)
+    ss_df['normalized_title'] = ss_df['title'].apply(normalize_title)
+
+    # Create sets for fast lookup
+    oa_titles = set(oa_df['normalized_title'].dropna())
+    ss_titles = set(ss_df['normalized_title'].dropna())
+
+    # Add indicators
+    oa_df['in_semantic_scholar'] = oa_df['normalized_title'].isin(ss_titles)
+    ss_df['in_openalex'] = ss_df['normalized_title'].isin(oa_titles)
+
+    # Calculate statistics
+    oa_in_ss = oa_df['in_semantic_scholar'].sum()
+    ss_in_oa = ss_df['in_openalex'].sum()
+
+    print(f"    OpenAlex papers also in Semantic Scholar: {oa_in_ss} ({100*oa_in_ss/len(oa_df):.1f}%)")
+    print(f"    Semantic Scholar papers also in OpenAlex: {ss_in_oa} ({100*ss_in_oa/len(ss_df):.1f}%)")
+
+    # Save with indicators
+    oa_indicator_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_openalex_semantic_scholar_indicator.csv")
+    oa_df.to_csv(oa_indicator_file, index=False)
+    print(f"    Saved: {oa_indicator_file}")
+
+    return {
+        'policy_abbr': policy_abbr,
+        'openalex_total': len(oa_df),
+        'semantic_scholar_total': len(ss_df),
+        'oa_in_ss': int(oa_in_ss),
+        'oa_in_ss_pct': 100 * oa_in_ss / len(oa_df) if len(oa_df) > 0 else 0,
+        'ss_in_oa': int(ss_in_oa),
+        'ss_in_oa_pct': 100 * ss_in_oa / len(ss_df) if len(ss_df) > 0 else 0
+    }
 
 
 def process_policy(policy_row):
@@ -411,35 +641,53 @@ def process_policy(policy_row):
     
     all_papers = []
     search_metadata = []
-    
-    # Search for each term
-    for term in search_terms:
-        results = search_openalex(term, per_page=100, max_results=1500)
-        
+    results_lock = threading.Lock()
+
+    def search_single_term(term):
+        """Search for a single term and return results with metadata."""
+        results = search_openalex(term, per_page=PER_PAGE, max_results=MAX_RESULTS_PER_TERM)
+
         # Save raw results for this term
         safe_term = term.replace(' ', '_').replace('/', '_').lower()
         raw_file = os.path.join(TMP_DIR, f"raw_{policy_abbr}_{safe_term}.json")
         with open(raw_file, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"    Saved raw results to: {raw_file}")
-        
+
         # Extract paper info
+        papers = []
         for work in results:
             paper_info = extract_paper_info(work)
             paper_info['search_term'] = term
-            all_papers.append(paper_info)
-        
-        search_metadata.append({
+            papers.append(paper_info)
+
+        metadata = {
             'search_term': term,
             'results_count': len(results),
             'timestamp': datetime.now().isoformat()
-        })
-        
-        print(f"    Extracted info from {len(results)} papers")
+        }
+
+        print(f"    Extracted info from {len(results)} papers for '{term}'")
+        return papers, metadata
+
+    # Search for each term in parallel
+    print(f"\n  Searching {len(search_terms)} terms in parallel (max {MAX_WORKERS} workers)...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_term = {executor.submit(search_single_term, term): term for term in search_terms}
+
+        for future in as_completed(future_to_term):
+            term = future_to_term[future]
+            try:
+                papers, metadata = future.result()
+                with results_lock:
+                    all_papers.extend(papers)
+                    search_metadata.append(metadata)
+            except Exception as e:
+                print(f"    ERROR processing term '{term}': {e}")
     
     # Create DataFrame
     df = pd.DataFrame(all_papers)
-    
+
     if len(df) == 0:
         print(f"\n  WARNING: No papers found for {policy_name}")
         return {
@@ -447,13 +695,26 @@ def process_policy(policy_row):
             'policy_name': policy_name,
             'total_papers': 0,
             'unique_papers': 0,
-            'duplicates_removed': 0
+            'duplicates_removed': 0,
+            'pre_policy_filtered': 0
         }
-    
-    # Remove duplicates (based on OpenAlex ID)
-    print(f"\n  Removing duplicates...")
+
     initial_count = len(df)
-    df_unique = df.drop_duplicates(subset=['openalex_id'], keep='first')
+
+    # Aggregate all search terms for each paper (instead of keeping just the first)
+    print(f"\n  Aggregating search terms and removing duplicates...")
+    search_terms_agg = df.groupby('openalex_id')['search_term'].apply(
+        lambda x: ' | '.join(sorted(set(x)))
+    ).reset_index()
+    search_terms_agg.columns = ['openalex_id', 'search_terms_matched']
+
+    # Keep first occurrence of each paper (for other columns)
+    df_unique = df.drop_duplicates(subset=['openalex_id'], keep='first').copy()
+
+    # Merge aggregated search terms
+    df_unique = df_unique.drop(columns=['search_term'])
+    df_unique = df_unique.merge(search_terms_agg, on='openalex_id', how='left')
+
     duplicate_count = initial_count - len(df_unique)
     print(f"    Initial: {initial_count} | Duplicates: {duplicate_count} | Unique: {len(df_unique)}")
 
@@ -464,46 +725,39 @@ def process_policy(policy_row):
     filtered_count = pre_filter_count - len(df_unique)
     print(f"    Before filter: {pre_filter_count} | Filtered out: {filtered_count} | After filter: {len(df_unique)}")
 
-    # Filter by relevance (search terms in title/abstract)
-    print(f"\n  Filtering by relevance (search terms in title/abstract)...")
-    pre_relevance_count = len(df_unique)
-    df_unique = filter_by_relevance(df_unique, search_terms)
-    relevance_filtered = pre_relevance_count - len(df_unique)
-    print(f"    Before filter: {pre_relevance_count} | Filtered out: {relevance_filtered} | After filter: {len(df_unique)}")
+    # NO relevance filtering at scrape stage - will be done after abstract recovery
+    print(f"\n  Skipping relevance filtering (will be applied after abstract recovery)")
 
     # Add metadata columns
-    df_unique = df_unique.copy()
     df_unique['policy_studied'] = policy_name
     df_unique['policy_year'] = policy_year
     df_unique['policy_abbreviation'] = policy_abbr
     df_unique['policy_category'] = policy_category
     df_unique['data_source'] = 'OpenAlex'
     df_unique['scrape_date'] = datetime.now().strftime('%Y-%m-%d')
-    
-    # Reorder columns
+
+    # Reorder columns (search_terms_matched contains all matched terms)
     column_order = [
-        'openalex_id', 'doi', 'title', 'authors', 'author_count', 
+        'openalex_id', 'doi', 'title', 'authors', 'author_count',
         'author_affiliations', 'publication_year', 'publication_date',
         'source_name', 'source_type', 'abstract', 'cited_by_count',
         'is_open_access', 'open_access_url', 'concepts', 'type', 'language',
-        'search_term', 'policy_studied', 'policy_year', 'policy_abbreviation',
+        'search_terms_matched', 'policy_studied', 'policy_year', 'policy_abbreviation',
         'policy_category', 'data_source', 'scrape_date', 'url'
     ]
-    df_unique = df_unique[column_order]
-    
-    # Save outputs with policy abbreviation in filename
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
+    df_unique = df_unique[[c for c in column_order if c in df_unique.columns]]
+
+    # Save RAW outputs (no relevance filtering applied)
     # Save as Parquet (primary format)
-    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
+    parquet_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.parquet")
     df_unique.to_parquet(parquet_file, index=False, engine='pyarrow')
-    print(f"\n  Saved Parquet: {parquet_file}")
-    
+    print(f"\n  Saved RAW Parquet: {parquet_file}")
+
     # Save as CSV (for compatibility)
-    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
+    csv_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.csv")
     df_unique.to_csv(csv_file, index=False, encoding='utf-8')
-    print(f"  Saved CSV: {csv_file}")
-    
+    print(f"  Saved RAW CSV: {csv_file}")
+
     # Save metadata
     metadata = {
         'policy_name': policy_name,
@@ -515,53 +769,84 @@ def process_policy(policy_row):
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
-        'relevance_filtered': relevance_filtered,
-        'unique_papers': len(df_unique),
+        'unique_papers_raw': len(df_unique),
+        'note': 'Raw data without relevance filtering. Filtering applied after abstract recovery.',
         'search_details': search_metadata
     }
-    
-    metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_metadata.json")
+
+    metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_openalex_metadata.json")
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     print(f"  Saved metadata: {metadata_file}")
-    
+
     # Print summary
-    print(f"\n  SUMMARY for {policy_abbr}:")
-    print(f"    Unique papers: {len(df_unique)}")
+    print(f"\n  SUMMARY for {policy_abbr} (RAW DATA):")
+    print(f"    Unique papers (raw): {len(df_unique)}")
     print(f"    Date range: {df_unique['publication_year'].min()}-{df_unique['publication_year'].max()}")
     print(f"    Open access: {df_unique['is_open_access'].sum()} ({df_unique['is_open_access'].sum()/len(df_unique)*100:.1f}%)")
     print(f"    Median citations: {df_unique['cited_by_count'].median():.0f}")
-    
+    print(f"    Papers with abstracts: {(df_unique['abstract'].notna() & (df_unique['abstract'] != '')).sum()}")
+
     return {
         'policy_abbreviation': policy_abbr,
         'policy_name': policy_name,
         'total_papers': initial_count,
         'duplicates_removed': duplicate_count,
         'pre_policy_filtered': filtered_count,
-        'relevance_filtered': relevance_filtered,
-        'unique_papers': len(df_unique)
+        'unique_papers_raw': len(df_unique)
     }
+
+
+def is_policy_complete(policy_abbr, source_name):
+    """Check if a policy was already completed today (for --resume mode)."""
+    metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_{source_name}_metadata.json")
+    if not os.path.exists(metadata_file):
+        return False
+    mod_time = datetime.fromtimestamp(os.path.getmtime(metadata_file))
+    return mod_time.date() == datetime.now().date()
 
 
 def main():
     """
     Main execution function
     """
+    parser = argparse.ArgumentParser(description="Policy papers scraping from OpenAlex")
+    parser.add_argument('policies', nargs='*', help='Policy abbreviations to process (default: all)')
+    parser.add_argument('--resume', action='store_true', help='Skip policies already completed today')
+    args = parser.parse_args()
+
     print("="*80)
     print("POLICY PAPERS SCRAPING FROM OPENALEX")
     print("="*80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.resume:
+        print("  Mode: RESUME (skipping policies completed today)")
     print()
-    
+
     # Load policies configuration
     policies_df = load_policies(POLICIES_FILE)
+
+    # Filter to requested policies if specified
+    if args.policies:
+        policies_df = policies_df[policies_df['policy_abbreviation'].isin(args.policies)]
+        if policies_df.empty:
+            print(f"ERROR: No matching policies found for {args.policies}")
+            return
+
     print(f"\nPolicies to process:")
     for _, row in policies_df.iterrows():
         print(f"  - {row['policy_name']} ({row['policy_abbreviation']})")
-    
+
     # Process each policy
     all_summaries = []
     for idx, row in policies_df.iterrows():
+        policy_abbr = row['policy_abbreviation']
+
+        # Check checkpoint in resume mode
+        if args.resume and is_policy_complete(policy_abbr, 'openalex'):
+            print(f"\n  SKIP {row['policy_name']} — already completed today (--resume)")
+            continue
+
         try:
             summary = process_policy(row)
             all_summaries.append(summary)
@@ -575,15 +860,91 @@ def main():
     print(f"\n{'='*80}")
     print("OVERALL SUMMARY")
     print(f"{'='*80}")
-    
-    summary_df = pd.DataFrame(all_summaries)
-    print(summary_df.to_string(index=False))
-    
-    # Save overall summary
-    summary_file = os.path.join(OUTPUT_DIR, "all_policies_summary.csv")
-    summary_df.to_csv(summary_file, index=False)
-    print(f"\nSaved overall summary: {summary_file}")
-    
+
+    if all_summaries:
+        summary_df = pd.DataFrame(all_summaries)
+        print(summary_df.to_string(index=False))
+
+        # Save overall summary
+        summary_file = os.path.join(OUTPUT_DIR, "all_policies_summary.csv")
+        summary_df.to_csv(summary_file, index=False)
+        print(f"\nSaved overall summary: {summary_file}")
+    else:
+        print("  No policies were processed (all skipped or failed).")
+
+    # Compare with NBER
+    print(f"\n{'='*80}")
+    print("COMPARING WITH NBER")
+    print(f"{'='*80}")
+
+    nber_comparison_results = []
+    for _, row in policies_df.iterrows():
+        policy_abbr = row['policy_abbreviation']
+        try:
+            comparison = compare_with_nber(policy_abbr)
+            if comparison:
+                nber_comparison_results.append(comparison)
+        except Exception as e:
+            print(f"  ERROR comparing {policy_abbr} with NBER: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Save NBER comparison results
+    if nber_comparison_results:
+        comparison_df = pd.DataFrame(nber_comparison_results)
+        comparison_file = os.path.join(OUTPUT_DIR, "openalex_nber_comparison.csv")
+        comparison_df.to_csv(comparison_file, index=False)
+        print(f"\nSaved NBER comparison: {comparison_file}")
+
+    # Compare with Semantic Scholar
+    print(f"\n{'='*80}")
+    print("COMPARING WITH SEMANTIC SCHOLAR")
+    print(f"{'='*80}")
+
+    ss_comparison_results = []
+    for _, row in policies_df.iterrows():
+        policy_abbr = row['policy_abbreviation']
+        try:
+            comparison = compare_with_semantic_scholar(policy_abbr)
+            if comparison:
+                ss_comparison_results.append(comparison)
+        except Exception as e:
+            print(f"  ERROR comparing {policy_abbr} with Semantic Scholar: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Save Semantic Scholar comparison results
+    if ss_comparison_results:
+        comparison_df = pd.DataFrame(ss_comparison_results)
+        comparison_file = os.path.join(OUTPUT_DIR, "openalex_semantic_scholar_comparison.csv")
+        comparison_df.to_csv(comparison_file, index=False)
+        print(f"\nSaved Semantic Scholar comparison: {comparison_file}")
+
+    # Print comparison results
+    if nber_comparison_results:
+        print(f"\n{'='*80}")
+        print("OPENALEX vs NBER COVERAGE")
+        print(f"{'='*80}")
+        for result in nber_comparison_results:
+            print(f"\n{result['policy_abbr']}:")
+            print(f"  OpenAlex papers: {result['openalex_total']}")
+            print(f"  NBER papers: {result['nber_total']}")
+            print(f"  OpenAlex in NBER: {result['oa_in_nber']} ({result['oa_in_nber_pct']:.1f}%)")
+            print(f"  NBER in OpenAlex: {result['nber_in_oa']} ({result['nber_in_oa_pct']:.1f}%)")
+            if result['nber_missing_from_oa'] > 0:
+                print(f"  *** {result['nber_missing_from_oa']} NBER papers MISSING from OpenAlex ***")
+
+    if ss_comparison_results:
+        print(f"\n{'='*80}")
+        print("OPENALEX vs SEMANTIC SCHOLAR COVERAGE")
+        print(f"{'='*80}")
+        for result in ss_comparison_results:
+            print(f"\n{result['policy_abbr']}:")
+            print(f"  OpenAlex papers: {result['openalex_total']}")
+            print(f"  Semantic Scholar papers: {result['semantic_scholar_total']}")
+            print(f"  OpenAlex in SS: {result['oa_in_ss']} ({result['oa_in_ss_pct']:.1f}%)")
+            print(f"  SS in OpenAlex: {result['ss_in_oa']} ({result['ss_in_oa_pct']:.1f}%)")
+
     print(f"\n{'='*80}")
     print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}")

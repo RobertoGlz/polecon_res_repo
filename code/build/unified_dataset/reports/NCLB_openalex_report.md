@@ -1,6 +1,6 @@
 # OpenAlex Report: NCLB
 
-**Generated:** 2026-01-28 16:30:54
+**Generated:** 2026-02-09 02:45:59
 
 ---
 
@@ -8,12 +8,12 @@
 
 | Metric | Value |
 |--------|-------|
-| Total Papers | 3695 |
-| Papers with Abstract | 66.6% |
-| Papers with DOI | 62.8% |
-| Papers with Open Access URL | 24.7% |
-| Year Range | 2001-2025 |
-| Median Citations | 9.0 |
+| Total Papers | 19187 |
+| Papers with Abstract | 39.0% |
+| Papers with DOI | 63.2% |
+| Papers with Open Access URL | 61.3% |
+| Year Range | 2001-2026 |
+| Median Citations | 7.0 |
 
 ## Data Source Notes
 

@@ -40,10 +40,12 @@ Dependencies:
 Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 14, 2026
 Updated: January 27, 2026 - Added relevance filtering after abstract recovery
+Updated: February 6, 2026 - Parallelize all steps with ThreadPoolExecutor, BrowserPool, per-API RateLimiters
 """
 
 import requests
 from bs4 import BeautifulSoup
+import argparse
 import pandas as pd
 import time
 import re
@@ -53,6 +55,9 @@ import os
 import sys
 import tempfile
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue
 
 # PDF extraction - optional dependency
 try:
@@ -95,6 +100,12 @@ FAILURE_REASONS = {
     'ssrn_no_abstract_element': 'SSRN page loaded but no abstract element found',
     'ssrn_timeout': 'SSRN page did not load in time',
     'ssrn_browser_error': 'Selenium browser error',
+
+    # NBER failures
+    'nber_no_id': 'Could not extract NBER paper ID from URL',
+    'nber_no_abstract_element': 'NBER page loaded but no abstract element found',
+    'nber_connection_error': 'Failed to connect to NBER website',
+    'nber_timeout': 'NBER page request timed out',
 }
 
 # Selenium imports for SSRN scraping (SSRN blocks simple requests)
@@ -128,6 +139,93 @@ POLICIES_FILE = os.path.normpath(POLICIES_FILE)
 # Create directories if they don't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
+
+# =============================================================================
+# PARALLELIZATION CONFIGURATION
+# =============================================================================
+MAX_WORKERS_CROSSREF = 5
+MAX_WORKERS_OA = 8
+MAX_WORKERS_PDF = 4
+MAX_WORKERS_SELENIUM = 3
+MAX_WORKERS_SSRN = 3
+MAX_WORKERS_NBER = 5
+
+
+class RateLimiter:
+    """Thread-safe rate limiter for API requests."""
+    def __init__(self, delay):
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.last_request = 0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_request
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+            self.last_request = time.time()
+
+
+# Per-API rate limiters
+crossref_limiter = RateLimiter(0.1)    # CrossRef polite pool is generous
+oa_url_limiter = RateLimiter(0.05)     # Diverse servers, light global throttle
+nber_limiter = RateLimiter(0.3)        # NBER website, be polite
+ssrn_limiter = RateLimiter(0.8)        # SSRN is sensitive
+
+
+class BrowserPool:
+    """Thread-safe pool of reusable Selenium browsers."""
+    def __init__(self, size, create_fn):
+        self._queue = queue.Queue(maxsize=size)
+        self._browsers = []
+        for _ in range(size):
+            browser = create_fn()
+            self._browsers.append(browser)
+            self._queue.put(browser)
+
+    def acquire(self, timeout=60):
+        """Borrow a browser from the pool (blocks if none available)."""
+        return self._queue.get(timeout=timeout)
+
+    def release(self, browser):
+        """Return a browser to the pool."""
+        self._queue.put(browser)
+
+    def close_all(self):
+        """Quit all browsers in the pool."""
+        for browser in self._browsers:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+
+
+class ProgressCounter:
+    """Thread-safe progress counter with periodic reporting."""
+    def __init__(self, total, label="Progress", report_every=50):
+        self._lock = threading.Lock()
+        self._processed = 0
+        self._recovered = 0
+        self._total = total
+        self._label = label
+        self._report_every = report_every
+
+    def increment(self, recovered=False):
+        with self._lock:
+            self._processed += 1
+            if recovered:
+                self._recovered += 1
+            if self._processed % self._report_every == 0:
+                print(f"  {self._label}: {self._processed}/{self._total} ({self._recovered} recovered)")
+
+    @property
+    def processed(self):
+        return self._processed
+
+    @property
+    def recovered(self):
+        return self._recovered
 
 
 def strip_html_tags(text):
@@ -1042,6 +1140,127 @@ def extract_ssrn_id(url):
     return None
 
 
+def extract_nber_id(url):
+    """
+    Extract NBER paper ID from a URL.
+
+    NBER URLs typically have the format:
+    - https://www.nber.org/papers/w31824
+    - /papers/w31824
+
+    Parameters:
+    -----------
+    url : str
+        URL that may contain an NBER paper ID
+
+    Returns:
+    --------
+    str or None : The NBER paper ID (e.g., "w31824") if found, None otherwise
+    """
+    if not url:
+        return None
+
+    url = str(url)
+
+    # Pattern: /papers/wXXXXX or /papers/tXXXXX (working papers or technical papers)
+    match = re.search(r'/papers/([wt]\d+)', url)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def get_abstract_from_nber(nber_id, timeout=15):
+    """
+    Get full abstract from NBER website for a given paper ID.
+
+    NBER API returns truncated abstracts, but the website has full abstracts.
+    This function scrapes the full abstract from the NBER paper page.
+
+    Parameters:
+    -----------
+    nber_id : str
+        NBER paper ID (e.g., "w31824")
+    timeout : int
+        Request timeout in seconds
+
+    Returns:
+    --------
+    dict : Result with keys:
+        - 'abstract': The full abstract text (or None if not found)
+        - 'success': Boolean indicating if abstract was found
+        - 'failure_reason': Reason for failure (if not successful)
+    """
+    result = {
+        'abstract': None,
+        'success': False,
+        'failure_reason': None
+    }
+
+    if not nber_id:
+        result['failure_reason'] = 'nber_no_id'
+        return result
+
+    url = f"https://www.nber.org/papers/{nber_id}"
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=timeout)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # NBER abstract is typically in:
+        # 1. <div class="page-header__intro-inner"> or similar
+        # 2. <meta name="description"> tag
+        # 3. Look for div/p with abstract-related classes
+
+        abstract = None
+
+        # Try specific NBER selectors
+        selectors = [
+            'div.page-header__intro-inner',
+            'div.page-header__intro',
+            'div[class*="abstract"]',
+            'section[class*="abstract"]',
+            'div.paper-abstract',
+            'p.abstract',
+        ]
+
+        for selector in selectors:
+            element = soup.select_one(selector)
+            if element:
+                text = element.get_text(strip=True)
+                # Clean up the text
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 100:  # Reasonable abstract length
+                    abstract = text
+                    break
+
+        # Try meta description as fallback
+        if not abstract:
+            meta = soup.find('meta', {'name': 'description'})
+            if meta:
+                content = meta.get('content', '')
+                if len(content) > 100:
+                    abstract = content
+
+        if abstract:
+            result['abstract'] = abstract
+            result['success'] = True
+        else:
+            result['failure_reason'] = 'nber_no_abstract_element'
+
+    except requests.exceptions.Timeout:
+        result['failure_reason'] = 'nber_timeout'
+    except requests.exceptions.RequestException as e:
+        result['failure_reason'] = 'nber_connection_error'
+
+    return result
+
+
 def create_selenium_browser():
     """
     Create a headless Chrome browser for SSRN scraping.
@@ -1203,6 +1422,12 @@ def load_openalex_papers(policy_abbr):
     """
     Load papers scraped from OpenAlex for a given policy.
 
+    Looks for files in this order:
+    1. {policy_abbr}_papers_openalex_raw.parquet (new format with all raw data)
+    2. {policy_abbr}_papers_openalex_raw.csv
+    3. {policy_abbr}_papers_openalex.parquet (legacy format)
+    4. {policy_abbr}_papers_openalex.csv
+
     Parameters:
     -----------
     policy_abbr : str
@@ -1212,21 +1437,26 @@ def load_openalex_papers(policy_abbr):
     --------
     pd.DataFrame : Papers dataframe, or None if file not found
     """
-    # Try Parquet first (more efficient), then CSV
-    parquet_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet")
-    csv_file = os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv")
+    # Try _raw files first (new format), then legacy format
+    files_to_try = [
+        os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.parquet"),
+        os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex_raw.csv"),
+        os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.parquet"),
+        os.path.join(OPENALEX_OUTPUT_DIR, f"{policy_abbr}_papers_openalex.csv"),
+    ]
 
-    if os.path.exists(parquet_file):
-        print(f"Loading papers from: {parquet_file}")
-        return pd.read_parquet(parquet_file)
-    elif os.path.exists(csv_file):
-        print(f"Loading papers from: {csv_file}")
-        return pd.read_csv(csv_file)
-    else:
-        print(f"ERROR: No papers file found for {policy_abbr}")
-        print(f"  Looked for: {parquet_file}")
-        print(f"  Looked for: {csv_file}")
-        return None
+    for file_path in files_to_try:
+        if os.path.exists(file_path):
+            print(f"Loading papers from: {file_path}")
+            if file_path.endswith('.parquet'):
+                return pd.read_parquet(file_path)
+            else:
+                return pd.read_csv(file_path)
+
+    print(f"ERROR: No papers file found for {policy_abbr}")
+    for f in files_to_try:
+        print(f"  Looked for: {f}")
+    return None
 
 
 def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
@@ -1294,7 +1524,11 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         'ssrn_fetched': 0,
         'ssrn_recovered': 0,
         'ssrn_failed': 0,
-        'ssrn_no_abstract': 0
+        'ssrn_no_abstract': 0,
+        'nber_fetched': 0,
+        'nber_recovered': 0,
+        'nber_failed': 0,
+        'nber_no_abstract': 0
     }
 
     # Store raw responses for debugging
@@ -1307,22 +1541,37 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     all_failures = []
 
     # =========================================================================
-    # STEP 1: Try CrossRef API for all papers with DOIs
+    # STEP 1: Try CrossRef API for all papers with DOIs (parallelized)
     # =========================================================================
     if len(to_fetch_crossref) > 0:
-        print(f"\n[Step 1/3] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers...")
+        print(f"\n[Step 1/5] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers ({MAX_WORKERS_CROSSREF} workers)...")
 
-        for idx, (df_idx, row) in enumerate(to_fetch_crossref.iterrows()):
+        progress = ProgressCounter(len(to_fetch_crossref), "CrossRef")
+        crossref_results = []  # Collect (df_idx, result, doi, title) tuples
+
+        def fetch_crossref_one(df_idx, row):
             doi = row['doi']
-            title = row.get('title', 'Unknown')[:50]
-
-            if idx % 50 == 0 and idx > 0:
-                print(f"  Progress: {idx}/{len(to_fetch_crossref)} ({stats['crossref_recovered']} recovered)")
-
+            title = str(row.get('title', 'Unknown') or 'Unknown')[:50]
+            crossref_limiter.wait()
             result = get_abstract_from_crossref(doi)
+            progress.increment(recovered=result['success'] and result['has_abstract'])
+            return (df_idx, result, doi, title)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_CROSSREF) as executor:
+            futures = {
+                executor.submit(fetch_crossref_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_crossref.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    crossref_results.append(future.result())
+                except Exception as e:
+                    print(f"    CrossRef worker error: {e}")
+
+        # Batch-apply results to DataFrame (single-threaded)
+        for df_idx, result, doi, title in crossref_results:
             stats['crossref_fetched'] += 1
 
-            # Store raw response for debugging
             response_entry = {
                 'doi': doi,
                 'title': title,
@@ -1335,13 +1584,11 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
             crossref_responses.append(response_entry)
 
             if result['success'] and result['has_abstract']:
-                # Update the dataframe
                 df.at[df_idx, 'abstract'] = result['abstract']
                 df.at[df_idx, 'abstract_source'] = 'CrossRef'
                 stats['crossref_recovered'] += 1
             elif result['success'] and not result['has_abstract']:
                 stats['crossref_no_abstract'] += 1
-                # Log failure
                 all_failures.append({
                     'source': 'CrossRef',
                     'paper_title': title,
@@ -1368,9 +1615,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                     'error': result.get('error')
                 })
 
-            # Be polite to the API
-            time.sleep(delay)
-
         print(f"  CrossRef completed: {stats['crossref_fetched']} fetched, {stats['crossref_recovered']} recovered")
 
     # Save CrossRef responses
@@ -1389,24 +1633,39 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     to_fetch_oa = df[still_missing_mask & has_oa_url_mask]
 
     if len(to_fetch_oa) > 0:
-        print(f"\n[Step 2/5] Scraping abstracts from Open Access URLs for {len(to_fetch_oa)} papers...")
+        print(f"\n[Step 2/5] Scraping abstracts from Open Access URLs for {len(to_fetch_oa)} papers ({MAX_WORKERS_OA} workers)...")
 
         # Track PDFs and JavaScript-required pages for later processing
         pdf_urls_to_process = []
         js_urls_to_process = []
 
-        for idx, (df_idx, row) in enumerate(to_fetch_oa.iterrows()):
+        progress = ProgressCounter(len(to_fetch_oa), "OA URL")
+        oa_results = []  # Collect (df_idx, result, oa_url, title, doi) tuples
+
+        def fetch_oa_one(df_idx, row):
             oa_url = row['open_access_url']
-            title = row.get('title', 'Unknown')[:50]
-            doi = row.get('doi', '')
-
-            if idx % 50 == 0 and idx > 0:
-                print(f"  Progress: {idx}/{len(to_fetch_oa)} ({stats['oa_url_recovered']} recovered)")
-
+            title = str(row.get('title', 'Unknown') or 'Unknown')[:50]
+            doi = row.get('doi', '') or ''
+            oa_url_limiter.wait()
             result = get_abstract_from_oa_url(oa_url)
+            progress.increment(recovered=result['success'] and result['has_abstract'])
+            return (df_idx, result, oa_url, title, doi)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_OA) as executor:
+            futures = {
+                executor.submit(fetch_oa_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_oa.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    oa_results.append(future.result())
+                except Exception as e:
+                    print(f"    OA URL worker error: {e}")
+
+        # Batch-apply results to DataFrame (single-threaded)
+        for df_idx, result, oa_url, title, doi in oa_results:
             stats['oa_url_fetched'] += 1
 
-            # Store raw response for debugging
             response_entry = {
                 'open_access_url': oa_url,
                 'title': title,
@@ -1423,12 +1682,10 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
             oa_url_responses.append(response_entry)
 
             if result['success'] and result['has_abstract']:
-                # Update the dataframe
                 df.at[df_idx, 'abstract'] = result['abstract']
                 df.at[df_idx, 'abstract_source'] = 'OpenAccess'
                 stats['oa_url_recovered'] += 1
             elif result.get('is_pdf'):
-                # PDF detected - queue for PDF extraction
                 stats['oa_url_pdf_detected'] += 1
                 pdf_urls_to_process.append({
                     'df_idx': df_idx,
@@ -1437,7 +1694,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                     'doi': doi
                 })
             elif result.get('failure_reason') == 'oa_url_javascript_required':
-                # JavaScript required - queue for Selenium processing
                 stats['oa_url_js_detected'] = stats.get('oa_url_js_detected', 0) + 1
                 js_urls_to_process.append({
                     'df_idx': df_idx,
@@ -1447,7 +1703,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                 })
             elif result['success'] and not result['has_abstract']:
                 stats['oa_url_no_abstract'] += 1
-                # Log detailed failure
                 all_failures.append({
                     'source': 'OpenAccess',
                     'paper_title': title,
@@ -1470,9 +1725,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                     'http_status': result.get('http_status')
                 })
 
-            # Be polite to the servers
-            time.sleep(oa_delay)
-
         print(f"  Open Access URL completed: {stats['oa_url_fetched']} fetched, {stats['oa_url_recovered']} recovered")
         print(f"  PDFs detected for extraction: {stats['oa_url_pdf_detected']}")
         print(f"  JavaScript-required pages detected: {stats.get('oa_url_js_detected', 0)}")
@@ -1481,16 +1733,29 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         # STEP 2b: Try PDF extraction for detected PDF URLs
         # =========================================================================
         if len(pdf_urls_to_process) > 0 and PDF_EXTRACTION_AVAILABLE:
-            print(f"\n[Step 2b/4] Extracting abstracts from {len(pdf_urls_to_process)} PDF files...")
+            print(f"\n[Step 2b/5] Extracting abstracts from {len(pdf_urls_to_process)} PDF files ({MAX_WORKERS_PDF} workers)...")
 
-            for idx, pdf_info in enumerate(pdf_urls_to_process):
-                if idx % 20 == 0 and idx > 0:
-                    print(f"  Progress: {idx}/{len(pdf_urls_to_process)} ({stats['pdf_recovered']} recovered)")
+            progress_pdf = ProgressCounter(len(pdf_urls_to_process), "PDF", report_every=20)
+            pdf_results = []
 
+            def fetch_pdf_one(pdf_info):
+                oa_url_limiter.wait()
                 result = get_abstract_from_pdf(pdf_info['url'])
+                progress_pdf.increment(recovered=result['success'] and result['has_abstract'])
+                return (pdf_info, result)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS_PDF) as executor:
+                futures = {executor.submit(fetch_pdf_one, pi): pi for pi in pdf_urls_to_process}
+                for future in as_completed(futures):
+                    try:
+                        pdf_results.append(future.result())
+                    except Exception as e:
+                        print(f"    PDF worker error: {e}")
+
+            # Batch-apply results
+            for pdf_info, result in pdf_results:
                 stats['pdf_fetched'] += 1
 
-                # Store response
                 pdf_response_entry = {
                     'url': pdf_info['url'],
                     'title': pdf_info['title'],
@@ -1518,8 +1783,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                         'error': result.get('error')
                     })
 
-                time.sleep(oa_delay)
-
             print(f"  PDF extraction completed: {stats['pdf_fetched']} attempted, {stats['pdf_recovered']} recovered")
         elif len(pdf_urls_to_process) > 0:
             print(f"\n  WARNING: Skipping PDF extraction ({len(pdf_urls_to_process)} PDFs) - pdfplumber not installed")
@@ -1528,8 +1791,8 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         # STEP 2c: Try Selenium for JavaScript-required pages
         # =========================================================================
         if len(js_urls_to_process) > 0:
-            print(f"\n[Step 2c/5] Processing {len(js_urls_to_process)} JavaScript-rendered pages with Selenium...")
-            print("  Initializing Selenium browser (headless Chrome)...")
+            print(f"\n[Step 2c/5] Processing {len(js_urls_to_process)} JavaScript-rendered pages with Selenium ({MAX_WORKERS_SELENIUM} workers)...")
+            print("  Initializing Selenium browser pool...")
 
             # Initialize stats for JS/Selenium
             stats['selenium_fetched'] = 0
@@ -1537,19 +1800,36 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
             stats['selenium_failed'] = 0
 
             selenium_responses = []
-            browser = None
+            browser_pool = None
             try:
-                browser = create_selenium_browser()
-                print("  Browser initialized successfully")
+                browser_pool = BrowserPool(size=MAX_WORKERS_SELENIUM, create_fn=create_selenium_browser)
+                print(f"  Browser pool initialized ({MAX_WORKERS_SELENIUM} browsers)")
 
-                for idx, js_info in enumerate(js_urls_to_process):
-                    if idx % 20 == 0 and idx > 0:
-                        print(f"  Progress: {idx}/{len(js_urls_to_process)} ({stats['selenium_recovered']} recovered)")
+                progress_sel = ProgressCounter(len(js_urls_to_process), "Selenium", report_every=20)
+                selenium_worker_results = []
 
-                    result = get_abstract_with_selenium(js_info['url'], browser)
+                def fetch_selenium_one(js_info):
+                    browser = browser_pool.acquire()
+                    try:
+                        ssrn_limiter.wait()
+                        result = get_abstract_with_selenium(js_info['url'], browser)
+                        progress_sel.increment(recovered=result['success'] and result['has_abstract'])
+                        return (js_info, result)
+                    finally:
+                        browser_pool.release(browser)
+
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS_SELENIUM) as executor:
+                    futures = {executor.submit(fetch_selenium_one, ji): ji for ji in js_urls_to_process}
+                    for future in as_completed(futures):
+                        try:
+                            selenium_worker_results.append(future.result())
+                        except Exception as e:
+                            print(f"    Selenium worker error: {e}")
+
+                # Batch-apply results
+                for js_info, result in selenium_worker_results:
                     stats['selenium_fetched'] += 1
 
-                    # Store response
                     selenium_response_entry = {
                         'url': js_info['url'],
                         'title': js_info['title'],
@@ -1577,19 +1857,16 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                             'error': result.get('error')
                         })
 
-                    # Be polite
-                    time.sleep(ssrn_delay)
-
                 print(f"  Selenium completed: {stats['selenium_fetched']} attempted, {stats['selenium_recovered']} recovered")
 
             except Exception as e:
-                print(f"  ERROR initializing Selenium browser: {e}")
+                print(f"  ERROR initializing Selenium browser pool: {e}")
                 print("  Skipping JavaScript-rendered page processing")
 
             finally:
-                if browser:
-                    browser.quit()
-                    print("  Browser closed")
+                if browser_pool:
+                    browser_pool.close_all()
+                    print("  Browser pool closed")
 
             # Save Selenium responses
             selenium_file = os.path.join(TMP_DIR, "selenium_responses.json")
@@ -1616,27 +1893,52 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     to_fetch_ssrn = df[still_missing_mask & is_ssrn]
 
     if len(to_fetch_ssrn) > 0:
-        print(f"\n[Step 3/5] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers...")
-        print("  Initializing Selenium browser (headless Chrome)...")
+        print(f"\n[Step 3/5] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers ({MAX_WORKERS_SSRN} workers)...")
+        print("  Initializing Selenium browser pool...")
 
-        # Create Selenium browser for SSRN scraping
-        browser = None
+        # Create Selenium browser pool for SSRN scraping
+        browser_pool = None
         try:
-            browser = create_selenium_browser()
-            print("  Browser initialized successfully")
+            browser_pool = BrowserPool(size=MAX_WORKERS_SSRN, create_fn=create_selenium_browser)
+            print(f"  Browser pool initialized ({MAX_WORKERS_SSRN} browsers)")
 
-            for idx, (df_idx, row) in enumerate(to_fetch_ssrn.iterrows()):
-                doi = row.get('doi', '')
-                url = row.get('url', '')
-                title = row.get('title', 'Unknown')[:50]
+            progress_ssrn = ProgressCounter(len(to_fetch_ssrn), "SSRN", report_every=20)
+            ssrn_worker_results = []  # (df_idx, result_or_none, doi, url, title, ssrn_id)
 
-                if idx % 20 == 0 and idx > 0:
-                    print(f"  Progress: {idx}/{len(to_fetch_ssrn)} ({stats['ssrn_recovered']} recovered)")
+            def fetch_ssrn_one(df_idx, row):
+                doi = row.get('doi', '') or ''
+                url = row.get('url', '') or ''
+                title = str(row.get('title', 'Unknown') or 'Unknown')[:50]
 
-                # Try to extract SSRN ID from DOI or URL
                 ssrn_id = extract_ssrn_id(doi) or extract_ssrn_id(url)
-
                 if not ssrn_id:
+                    progress_ssrn.increment(recovered=False)
+                    return (df_idx, None, doi, url, title, None)
+
+                browser = browser_pool.acquire()
+                try:
+                    ssrn_limiter.wait()
+                    result = get_abstract_from_ssrn(ssrn_id, browser)
+                    progress_ssrn.increment(recovered=result['success'] and result['has_abstract'])
+                    return (df_idx, result, doi, url, title, ssrn_id)
+                finally:
+                    browser_pool.release(browser)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS_SSRN) as executor:
+                futures = {
+                    executor.submit(fetch_ssrn_one, df_idx, row): df_idx
+                    for df_idx, row in to_fetch_ssrn.iterrows()
+                }
+                for future in as_completed(futures):
+                    try:
+                        ssrn_worker_results.append(future.result())
+                    except Exception as e:
+                        print(f"    SSRN worker error: {e}")
+
+            # Batch-apply results
+            for df_idx, result, doi, url, title, ssrn_id in ssrn_worker_results:
+                if ssrn_id is None:
+                    # No SSRN ID found
                     ssrn_responses.append({
                         'doi': doi,
                         'title': title,
@@ -1656,10 +1958,8 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                     })
                     continue
 
-                result = get_abstract_from_ssrn(ssrn_id, browser)
                 stats['ssrn_fetched'] += 1
 
-                # Store raw response for debugging
                 ssrn_responses.append({
                     'doi': doi,
                     'title': title,
@@ -1672,7 +1972,6 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                 })
 
                 if result['success'] and result['has_abstract']:
-                    # Update the dataframe
                     df.at[df_idx, 'abstract'] = result['abstract']
                     df.at[df_idx, 'abstract_source'] = 'SSRN'
                     stats['ssrn_recovered'] += 1
@@ -1697,20 +1996,16 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
                         'error': result.get('error')
                     })
 
-                # Be polite - SSRN may rate limit aggressive scraping
-                time.sleep(ssrn_delay)
-
             print(f"  SSRN completed: {stats['ssrn_fetched']} fetched, {stats['ssrn_recovered']} recovered")
 
         except Exception as e:
-            print(f"  ERROR initializing Selenium browser: {e}")
+            print(f"  ERROR initializing Selenium browser pool: {e}")
             print("  Skipping SSRN scraping")
 
         finally:
-            # Always close the browser
-            if browser:
-                browser.quit()
-                print("  Browser closed")
+            if browser_pool:
+                browser_pool.close_all()
+                print("  Browser pool closed")
 
     # Save SSRN responses
     ssrn_file = os.path.join(TMP_DIR, "ssrn_responses.json")
@@ -1725,9 +2020,139 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     print(f"  Saved PDF responses to: {pdf_file}")
 
     # =========================================================================
-    # STEP 4: Save detailed failure log for diagnostic analysis
+    # STEP 4: Try NBER website for papers with NBER URLs (full abstracts)
     # =========================================================================
-    print(f"\n[Step 4/5] Saving detailed failure log...")
+    # NBER API returns truncated abstracts (~300 chars). This step fetches full
+    # abstracts from the NBER website for papers that have NBER URLs.
+
+    # Identify papers missing abstracts OR with truncated abstracts
+    # NBER API truncates at ~300 chars, so we consider abstracts < 350 chars as truncated
+    NBER_TRUNCATION_THRESHOLD = 350
+    still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
+
+    # Check for NBER papers by looking at URL column or data_source
+    # Handle None/NaN values safely by converting to string
+    url_col = df['url'].fillna('').astype(str)
+    has_nber_url = url_col.str.contains('/papers/[wt]\\d+', regex=True, case=False)
+
+    # Also check for NBER papers from NBER source (data_source == 'NBER')
+    if 'data_source' in df.columns:
+        is_nber_source = df['data_source'].fillna('').astype(str).str.upper() == 'NBER'
+    else:
+        is_nber_source = pd.Series(False, index=df.index)
+
+    # For NBER papers, also check if abstract is truncated (short)
+    abstract_col = df['abstract'].fillna('').astype(str)
+    abstract_lengths = abstract_col.str.len()
+    has_truncated_abstract = (abstract_lengths > 0) & (abstract_lengths <= NBER_TRUNCATION_THRESHOLD)
+    is_nber_paper = has_nber_url | is_nber_source
+
+    # Fetch for: (missing abstract AND has NBER URL) OR (truncated abstract AND is NBER paper)
+    needs_nber_fetch = (still_missing_mask & has_nber_url) | (has_truncated_abstract & is_nber_paper)
+    to_fetch_nber = df[needs_nber_fetch]
+
+    # Count how many are truncated vs missing
+    truncated_count = int((has_truncated_abstract & is_nber_paper & ~still_missing_mask).sum())
+    missing_count = int((still_missing_mask & is_nber_paper).sum())
+    print(f"  NBER papers with missing abstracts: {missing_count}")
+    print(f"  NBER papers with truncated abstracts (<={NBER_TRUNCATION_THRESHOLD} chars): {truncated_count}")
+
+    nber_responses = []
+
+    if len(to_fetch_nber) > 0:
+        print(f"\n[Step 4/5] Fetching full abstracts from NBER website for {len(to_fetch_nber)} papers ({MAX_WORKERS_NBER} workers)...")
+
+        progress_nber = ProgressCounter(len(to_fetch_nber), "NBER", report_every=20)
+        nber_worker_results = []  # (df_idx, result_or_none, url, title, nber_id)
+
+        def fetch_nber_one(df_idx, row):
+            url = row.get('url', '') or ''
+            title_raw = row.get('title', 'Unknown') or 'Unknown'
+            title = str(title_raw)[:50]
+
+            nber_id = extract_nber_id(url)
+            if not nber_id:
+                progress_nber.increment(recovered=False)
+                return (df_idx, None, url, title, None)
+
+            nber_limiter.wait()
+            result = get_abstract_from_nber(nber_id)
+            progress_nber.increment(recovered=result['success'] and bool(result['abstract']))
+            return (df_idx, result, url, title, nber_id)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_NBER) as executor:
+            futures = {
+                executor.submit(fetch_nber_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_nber.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    nber_worker_results.append(future.result())
+                except Exception as e:
+                    print(f"    NBER worker error: {e}")
+
+        # Batch-apply results
+        for df_idx, result, url, title, nber_id in nber_worker_results:
+            if nber_id is None:
+                nber_responses.append({
+                    'url': url,
+                    'title': title,
+                    'nber_id': None,
+                    'success': False,
+                    'error': 'Could not extract NBER ID',
+                    'failure_reason': 'nber_no_id'
+                })
+                stats['nber_failed'] += 1
+                all_failures.append({
+                    'source': 'NBER',
+                    'paper_title': title,
+                    'url': url,
+                    'failure_reason': 'nber_no_id',
+                    'error': 'Could not extract NBER ID from URL'
+                })
+                continue
+
+            stats['nber_fetched'] += 1
+
+            nber_responses.append({
+                'url': url,
+                'title': title,
+                'nber_id': nber_id,
+                'success': result['success'],
+                'error': result.get('failure_reason'),
+                'abstract_preview': result['abstract'][:100] if result['abstract'] else None
+            })
+
+            if result['success'] and result['abstract']:
+                df.at[df_idx, 'abstract'] = result['abstract']
+                df.at[df_idx, 'abstract_source'] = 'NBER'
+                stats['nber_recovered'] += 1
+            else:
+                if result.get('failure_reason') == 'nber_no_abstract_element':
+                    stats['nber_no_abstract'] += 1
+                else:
+                    stats['nber_failed'] += 1
+                all_failures.append({
+                    'source': 'NBER',
+                    'paper_title': title,
+                    'url': url,
+                    'nber_id': nber_id,
+                    'failure_reason': result.get('failure_reason', 'nber_connection_error'),
+                    'error': result.get('failure_reason')
+                })
+
+        print(f"  NBER completed: {stats['nber_fetched']} fetched, {stats['nber_recovered']} recovered")
+
+    # Save NBER responses
+    nber_file = os.path.join(TMP_DIR, "nber_responses.json")
+    with open(nber_file, 'w') as f:
+        json.dump(nber_responses, f, indent=2)
+    print(f"  Saved NBER responses to: {nber_file}")
+
+    # =========================================================================
+    # STEP 5: Save detailed failure log for diagnostic analysis
+    # =========================================================================
+    print(f"\n[Step 5/5] Saving detailed failure log...")
 
     # Aggregate failure statistics by reason
     failure_stats = {}
@@ -1762,7 +2187,8 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         stats['oa_url_recovered'] +
         stats['pdf_recovered'] +
         stats.get('selenium_recovered', 0) +
-        stats['ssrn_recovered']
+        stats['ssrn_recovered'] +
+        stats['nber_recovered']
     )
 
     return df, stats
@@ -1814,6 +2240,7 @@ def process_policy(policy_abbr):
     print(f"    Abstracts recovered from PDFs: {stats['pdf_recovered']}")
     print(f"    Abstracts recovered from Selenium (JS pages): {stats.get('selenium_recovered', 0)}")
     print(f"    Abstracts recovered from SSRN: {stats['ssrn_recovered']}")
+    print(f"    Abstracts recovered from NBER (full): {stats['nber_recovered']}")
     print(f"    Total recovered: {stats['total_recovered']}")
     print(f"    Papers with abstracts after complementing: {after_complement_with_abstract}")
     print(f"    Papers still missing abstracts: {len(df_complemented) - after_complement_with_abstract}")
@@ -1881,6 +2308,7 @@ def process_policy(policy_abbr):
         'abstracts_from_pdf': int((df_complemented['abstract_source'] == 'PDF').sum()),
         'abstracts_from_selenium': int((df_complemented['abstract_source'] == 'Selenium').sum()),
         'abstracts_from_ssrn': int((df_complemented['abstract_source'] == 'SSRN').sum()),
+        'abstracts_from_nber': int((df_complemented['abstract_source'] == 'NBER').sum()),
         'still_missing_after_complement': int(len(df_complemented) - after_complement_with_abstract),
         'relevance_filter': {
             'before_filter': pre_filter_count,
@@ -1896,7 +2324,8 @@ def process_policy(policy_abbr):
         'oa_url_stats': {k: v for k, v in stats.items() if k.startswith('oa_url_')},
         'pdf_stats': {k: v for k, v in stats.items() if k.startswith('pdf_')},
         'selenium_stats': {k: v for k, v in stats.items() if k.startswith('selenium_')},
-        'ssrn_stats': {k: v for k, v in stats.items() if k.startswith('ssrn_')}
+        'ssrn_stats': {k: v for k, v in stats.items() if k.startswith('ssrn_')},
+        'nber_stats': {k: v for k, v in stats.items() if k.startswith('nber_')}
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_complement_metadata.json")
@@ -1914,14 +2343,21 @@ def main():
     Processes all policy abbreviations provided as command line arguments,
     or all policies from the policies.csv file if none provided.
     """
+    parser = argparse.ArgumentParser(description="Complement missing abstracts and apply relevance filter")
+    parser.add_argument('policies', nargs='*', help='Policy abbreviations to process (default: all)')
+    parser.add_argument('--resume', action='store_true', help='Skip policies already completed today')
+    args = parser.parse_args()
+
     print("=" * 80)
     print("COMPLEMENT MISSING ABSTRACTS AND APPLY RELEVANCE FILTER")
     print("=" * 80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.resume:
+        print("  Mode: RESUME (skipping policies completed today)")
 
     # Get policy abbreviations from command line or load from policies file
-    if len(sys.argv) > 1:
-        policy_abbrs = sys.argv[1:]
+    if args.policies:
+        policy_abbrs = args.policies
     else:
         # Load all policies from file
         if os.path.exists(POLICIES_FILE):
@@ -1935,6 +2371,15 @@ def main():
     # Process each policy
     all_results = []
     for policy_abbr in policy_abbrs:
+        # Check checkpoint in resume mode
+        if args.resume:
+            metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_complement_metadata.json")
+            if os.path.exists(metadata_file):
+                mod_time = datetime.fromtimestamp(os.path.getmtime(metadata_file))
+                if mod_time.date() == datetime.now().date():
+                    print(f"\n  SKIP {policy_abbr} — already completed today (--resume)")
+                    continue
+
         try:
             result = process_policy(policy_abbr)
             if result:

@@ -19,6 +19,7 @@ Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 2026
 """
 
+import argparse
 import os
 import sys
 import json
@@ -170,18 +171,24 @@ def main():
 
     Processes all policies and generates unified datasets.
     """
+    parser = argparse.ArgumentParser(description="Unified policy papers dataset creation")
+    parser.add_argument('policies', nargs='*', help='Policy abbreviations to process (default: all)')
+    parser.add_argument('--resume', action='store_true', help='Skip policies already completed today')
+    args = parser.parse_args()
+
     print("=" * 80)
     print("UNIFIED POLICY PAPERS DATASET CREATION")
     print("=" * 80)
     print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if args.resume:
+        print("  Mode: RESUME (skipping policies completed today)")
     print(f"Base directory: {BASE_DIR}")
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Reports directory: {REPORTS_DIR}")
 
     # Get policy abbreviations
-    if len(sys.argv) > 1:
-        # Process specific policies from command line
-        policy_abbrs = sys.argv[1:]
+    if args.policies:
+        policy_abbrs = args.policies
     elif os.path.exists(POLICIES_FILE):
         # Load from policies file
         policies_df = pd.read_csv(POLICIES_FILE)
@@ -195,6 +202,15 @@ def main():
     # Process each policy
     all_results = []
     for policy_abbr in policy_abbrs:
+        # Check checkpoint in resume mode
+        if args.resume:
+            coverage_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_coverage_analysis.json")
+            if os.path.exists(coverage_file):
+                mod_time = datetime.fromtimestamp(os.path.getmtime(coverage_file))
+                if mod_time.date() == datetime.now().date():
+                    print(f"\n  SKIP {policy_abbr} — already completed today (--resume)")
+                    continue
+
         result = process_policy(policy_abbr)
         all_results.append(result)
 

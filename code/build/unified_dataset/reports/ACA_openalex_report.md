@@ -1,6 +1,6 @@
 # OpenAlex Report: ACA
 
-**Generated:** 2026-01-28 16:30:51
+**Generated:** 2026-02-09 02:45:45
 
 ---
 
@@ -8,12 +8,12 @@
 
 | Metric | Value |
 |--------|-------|
-| Total Papers | 5036 |
-| Papers with Abstract | 71.4% |
-| Papers with DOI | 79.0% |
-| Papers with Open Access URL | 41.8% |
-| Year Range | 2010-2025 |
-| Median Citations | 9.0 |
+| Total Papers | 89628 |
+| Papers with Abstract | 58.9% |
+| Papers with DOI | 77.5% |
+| Papers with Open Access URL | 73.9% |
+| Year Range | 2010-2026 |
+| Median Citations | 2.0 |
 
 ## Data Source Notes
 
