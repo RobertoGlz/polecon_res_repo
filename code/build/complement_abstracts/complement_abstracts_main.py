@@ -9,6 +9,10 @@ and attempts to retrieve them from multiple sources in order:
 1. CrossRef API - for papers with DOIs
 2. Open Access URL scraping - for papers with open_access_url (e.g., PubMed, arXiv)
 3. SSRN web scraping - for papers from SSRN Electronic Journal
+4. NBER website - for NBER papers with truncated/missing abstracts
+5. Semantic Scholar API - for papers with DOIs
+6. Europe PMC API - for papers with DOIs or titles
+7. DOI Resolution + Publisher Page Scraping - resolve DOIs to publisher pages
 
 Pipeline Overview:
 ------------------
@@ -17,8 +21,12 @@ Pipeline Overview:
 3. For papers with DOIs: Query CrossRef API
 4. For papers still missing abstracts with open_access_url: Scrape from OA URL
 5. For SSRN papers still missing abstracts: Scrape from SSRN website
-6. Update dataset with recovered abstracts and track source
-7. Save complemented dataset in Parquet/CSV formats
+6. For NBER papers: Fetch full abstracts from NBER website
+7. For papers with DOIs still missing: Query Semantic Scholar API
+8. For remaining papers: Query Europe PMC API (DOI + title fallback)
+9. For remaining papers with DOIs: Resolve DOI and scrape publisher page
+10. Update dataset with recovered abstracts and track source
+11. Save complemented dataset in Parquet/CSV formats
 
 Key Implementation Notes:
 -------------------------
@@ -27,7 +35,7 @@ Key Implementation Notes:
 - Open Access URL scraping looks for common abstract HTML elements/classes.
 - SSRN blocks simple HTTP requests, so we use Selenium with headless Chrome.
 - Selenium browser is reused across SSRN requests for efficiency.
-- Tracks abstract source (OpenAlex, CrossRef, OpenAccess, SSRN) in 'abstract_source' column.
+- Tracks abstract source (OpenAlex, CrossRef, OpenAccess, SSRN, NBER, SemanticScholar, EuropePMC, DOI_Publisher) in 'abstract_source' column.
 - Preserves original data; only updates rows with missing abstracts.
 
 Dependencies:
@@ -41,6 +49,7 @@ Author: Claude AI with modifications by Roberto Gonzalez
 Date: January 14, 2026
 Updated: January 27, 2026 - Added relevance filtering after abstract recovery
 Updated: February 6, 2026 - Parallelize all steps with ThreadPoolExecutor, BrowserPool, per-API RateLimiters
+Updated: February 16, 2026 - Add Semantic Scholar, Europe PMC, DOI Resolution steps (Steps 5-7)
 """
 
 import requests
@@ -106,6 +115,26 @@ FAILURE_REASONS = {
     'nber_no_abstract_element': 'NBER page loaded but no abstract element found',
     'nber_connection_error': 'Failed to connect to NBER website',
     'nber_timeout': 'NBER page request timed out',
+
+    # Semantic Scholar failures
+    'semantic_scholar_no_abstract': 'Paper found in Semantic Scholar but no abstract available',
+    'semantic_scholar_not_found': 'Paper not found in Semantic Scholar',
+    'semantic_scholar_api_error': 'Semantic Scholar API request failed',
+    'semantic_scholar_timeout': 'Semantic Scholar API request timed out',
+    'semantic_scholar_rate_limit': 'Semantic Scholar API rate limit exceeded',
+
+    # Europe PMC failures
+    'europepmc_no_abstract': 'Paper found in Europe PMC but no abstract available',
+    'europepmc_not_found': 'Paper not found in Europe PMC',
+    'europepmc_api_error': 'Europe PMC API request failed',
+    'europepmc_timeout': 'Europe PMC API request timed out',
+
+    # DOI Resolution / Publisher page scraping failures
+    'doi_resolution_redirect_failed': 'DOI resolution did not redirect to publisher page',
+    'doi_resolution_no_abstract': 'Publisher page loaded but no abstract found',
+    'doi_resolution_paywall': 'Publisher page behind paywall or login',
+    'doi_resolution_timeout': 'DOI resolution or publisher page request timed out',
+    'doi_resolution_blocked': 'Access blocked by publisher (HTTP 403/429)',
 }
 
 # Selenium imports for SSRN scraping (SSRN blocks simple requests)
@@ -149,6 +178,9 @@ MAX_WORKERS_PDF = 4
 MAX_WORKERS_SELENIUM = 3
 MAX_WORKERS_SSRN = 3
 MAX_WORKERS_NBER = 5
+MAX_WORKERS_SEMANTIC_SCHOLAR = 2
+MAX_WORKERS_EUROPEPMC = 5
+MAX_WORKERS_DOI_RESOLUTION = 4
 
 
 class RateLimiter:
@@ -172,6 +204,9 @@ crossref_limiter = RateLimiter(0.1)    # CrossRef polite pool is generous
 oa_url_limiter = RateLimiter(0.05)     # Diverse servers, light global throttle
 nber_limiter = RateLimiter(0.3)        # NBER website, be polite
 ssrn_limiter = RateLimiter(0.8)        # SSRN is sensitive
+semantic_scholar_limiter = RateLimiter(1.0)   # Strict 1 req/sec
+europepmc_limiter = RateLimiter(0.2)          # Free API, be moderate
+doi_resolution_limiter = RateLimiter(0.5)     # Publisher pages, be polite
 
 
 class BrowserPool:
@@ -1261,6 +1296,403 @@ def get_abstract_from_nber(nber_id, timeout=15):
     return result
 
 
+# =============================================================================
+# PUBLISHER-SPECIFIC CSS SELECTORS FOR DOI RESOLUTION SCRAPING
+# =============================================================================
+PUBLISHER_ABSTRACT_SELECTORS = {
+    'sciencedirect.com': [
+        'div.abstract.author div.abstract-content',
+        'div#abstracts div.abstract',
+        'div.Abstracts div.abstract',
+        'div[class*="abstract"] p',
+    ],
+    'springer.com': [
+        'div#Abs1-content p',
+        'section[data-title="Abstract"] p',
+        'div.c-article-section__content p',
+        'div.Abstract p',
+    ],
+    'nature.com': [
+        'div#Abs1-content p',
+        'div[data-component="article-body"] section#abstract p',
+        'div.c-article-section__content p',
+    ],
+    'wiley.com': [
+        'div.article-section__content.en.main',
+        'section.article-section__abstract div.article-section__content',
+        'div[class*="abstract-group"] p',
+    ],
+    'tandfonline.com': [
+        'div.abstractSection.abstractInFull p',
+        'div.NLM_abstract p',
+        'div.hlFld-Abstract p',
+    ],
+    'sagepub.com': [
+        'div.abstractSection.abstractInFull p',
+        'div.hlFld-Abstract p',
+        'section.abstract p',
+    ],
+    'oup.com': [
+        'section.abstract p',
+        'div.abstract p',
+        'section[class*="abstract"] p',
+    ],
+    'cambridge.org': [
+        'div.abstract p',
+        'div[class*="abstract-content"] p',
+    ],
+    'jstor.org': [
+        'div.abstract p',
+        'div[class*="abstract"] p',
+    ],
+}
+
+# Generic fallback selectors for any publisher
+GENERIC_ABSTRACT_SELECTORS = [
+    'meta[name="citation_abstract"]',
+    'meta[name="description"]',
+    'meta[name="DC.description"]',
+    'div[class*="abstract"] p',
+    'section[class*="abstract"] p',
+    'div[id*="abstract"] p',
+    'div[role="doc-abstract"] p',
+]
+
+
+def get_abstract_from_semantic_scholar(doi, timeout=10):
+    """
+    Query Semantic Scholar API to retrieve abstract for a given DOI.
+
+    Parameters:
+    -----------
+    doi : str
+        Digital Object Identifier
+    timeout : int
+        Request timeout in seconds
+
+    Returns:
+    --------
+    dict : Result with 'abstract', 'success', 'has_abstract', 'failure_reason', 'error'
+    """
+    result = {
+        'abstract': '',
+        'success': False,
+        'error': None,
+        'has_abstract': False,
+        'failure_reason': None
+    }
+
+    if not doi:
+        result['error'] = 'No DOI provided'
+        result['failure_reason'] = 'semantic_scholar_api_error'
+        return result
+
+    # Extract DOI from URL if needed
+    if doi.startswith('http'):
+        doi = doi.replace('https://doi.org/', '').replace('http://doi.org/', '')
+
+    url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+    params = {'fields': 'abstract'}
+    headers = {
+        'User-Agent': f'PolEconResearch/1.0 (mailto:{USER_EMAIL})'
+    }
+
+    # Add API key if available
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+    if api_key:
+        headers['x-api-key'] = api_key
+
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=timeout)
+
+        if response.status_code == 404:
+            result['success'] = True
+            result['error'] = 'Paper not found in Semantic Scholar'
+            result['failure_reason'] = 'semantic_scholar_not_found'
+            return result
+
+        if response.status_code == 429:
+            result['error'] = 'Rate limit exceeded'
+            result['failure_reason'] = 'semantic_scholar_rate_limit'
+            return result
+
+        response.raise_for_status()
+        data = response.json()
+
+        abstract_raw = data.get('abstract', '')
+        if abstract_raw:
+            result['abstract'] = strip_html_tags(abstract_raw)
+            result['has_abstract'] = True
+        else:
+            result['failure_reason'] = 'semantic_scholar_no_abstract'
+
+        result['success'] = True
+
+    except requests.exceptions.Timeout:
+        result['error'] = 'Request timeout'
+        result['failure_reason'] = 'semantic_scholar_timeout'
+    except requests.exceptions.RequestException as e:
+        result['error'] = f'Request error: {str(e)[:100]}'
+        result['failure_reason'] = 'semantic_scholar_api_error'
+    except json.JSONDecodeError:
+        result['error'] = 'Invalid JSON response'
+        result['failure_reason'] = 'semantic_scholar_api_error'
+    except Exception as e:
+        result['error'] = f'Unexpected error: {str(e)[:100]}'
+        result['failure_reason'] = 'semantic_scholar_api_error'
+
+    return result
+
+
+def get_abstract_from_europepmc(doi, title=None, timeout=10):
+    """
+    Query Europe PMC API to retrieve abstract for a given DOI, with title fallback.
+
+    Parameters:
+    -----------
+    doi : str
+        Digital Object Identifier
+    title : str, optional
+        Paper title for fallback search
+    timeout : int
+        Request timeout in seconds
+
+    Returns:
+    --------
+    dict : Result with 'abstract', 'success', 'has_abstract', 'failure_reason', 'error'
+    """
+    result = {
+        'abstract': '',
+        'success': False,
+        'error': None,
+        'has_abstract': False,
+        'failure_reason': None
+    }
+
+    if not doi and not title:
+        result['error'] = 'No DOI or title provided'
+        result['failure_reason'] = 'europepmc_api_error'
+        return result
+
+    base_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+    headers = {
+        'User-Agent': f'PolEconResearch/1.0 (mailto:{USER_EMAIL})'
+    }
+
+    # Try DOI search first
+    queries_to_try = []
+    if doi:
+        clean_doi = doi.replace('https://doi.org/', '').replace('http://doi.org/', '') if doi.startswith('http') else doi
+        queries_to_try.append(f'DOI:"{clean_doi}"')
+    if title:
+        # Clean title for search
+        clean_title = re.sub(r'[^\w\s]', '', str(title))[:150]
+        queries_to_try.append(f'TITLE:"{clean_title}"')
+
+    for query in queries_to_try:
+        try:
+            params = {
+                'query': query,
+                'format': 'json',
+                'resultType': 'core',
+                'pageSize': 1
+            }
+            response = requests.get(base_url, headers=headers, params=params, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+
+            results_list = data.get('resultList', {}).get('result', [])
+            if results_list:
+                paper = results_list[0]
+                abstract_raw = paper.get('abstractText', '')
+                if abstract_raw:
+                    result['abstract'] = strip_html_tags(abstract_raw)
+                    result['has_abstract'] = True
+                    result['success'] = True
+                    return result
+
+        except requests.exceptions.Timeout:
+            result['error'] = 'Request timeout'
+            result['failure_reason'] = 'europepmc_timeout'
+            return result
+        except requests.exceptions.RequestException as e:
+            result['error'] = f'Request error: {str(e)[:100]}'
+            result['failure_reason'] = 'europepmc_api_error'
+            return result
+        except json.JSONDecodeError:
+            result['error'] = 'Invalid JSON response'
+            result['failure_reason'] = 'europepmc_api_error'
+            return result
+        except Exception as e:
+            result['error'] = f'Unexpected error: {str(e)[:100]}'
+            result['failure_reason'] = 'europepmc_api_error'
+            return result
+
+    # If we get here, no abstract found from any query
+    result['success'] = True
+    if not queries_to_try:
+        result['failure_reason'] = 'europepmc_not_found'
+    else:
+        result['failure_reason'] = 'europepmc_no_abstract'
+    return result
+
+
+def get_abstract_from_doi_resolution(doi, timeout=15):
+    """
+    Resolve DOI and scrape abstract from publisher landing page.
+
+    Follows DOI redirect to publisher page, then uses publisher-specific
+    and generic CSS selectors to extract abstract text.
+
+    Parameters:
+    -----------
+    doi : str
+        Digital Object Identifier
+    timeout : int
+        Request timeout in seconds
+
+    Returns:
+    --------
+    dict : Result with 'abstract', 'success', 'has_abstract', 'failure_reason', 'error'
+    """
+    result = {
+        'abstract': '',
+        'success': False,
+        'error': None,
+        'has_abstract': False,
+        'failure_reason': None
+    }
+
+    if not doi:
+        result['error'] = 'No DOI provided'
+        result['failure_reason'] = 'doi_resolution_redirect_failed'
+        return result
+
+    # Extract DOI from URL if needed
+    if doi.startswith('http'):
+        doi = doi.replace('https://doi.org/', '').replace('http://doi.org/', '')
+
+    doi_url = f"https://doi.org/{doi}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+    }
+
+    try:
+        response = requests.get(doi_url, headers=headers, timeout=timeout, allow_redirects=True)
+
+        if response.status_code == 403 or response.status_code == 429:
+            result['error'] = f'Access blocked (HTTP {response.status_code})'
+            result['failure_reason'] = 'doi_resolution_blocked'
+            return result
+
+        if response.status_code >= 400:
+            result['error'] = f'HTTP {response.status_code}'
+            result['failure_reason'] = 'doi_resolution_redirect_failed'
+            return result
+
+        response.raise_for_status()
+
+        # Check if we actually got redirected to a publisher page
+        final_url = response.url
+        content_type = response.headers.get('Content-Type', '').lower()
+
+        if 'application/pdf' in content_type:
+            result['failure_reason'] = 'doi_resolution_no_abstract'
+            result['success'] = True
+            return result
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Check for login/paywall
+        if detect_login_redirect(soup, final_url):
+            result['failure_reason'] = 'doi_resolution_paywall'
+            result['success'] = True
+            return result
+
+        abstract_text = None
+        parsed_url = urlparse(final_url)
+        domain = parsed_url.netloc.lower()
+
+        # Try publisher-specific selectors first
+        for publisher_domain, selectors in PUBLISHER_ABSTRACT_SELECTORS.items():
+            if publisher_domain in domain:
+                for selector in selectors:
+                    elements = soup.select(selector)
+                    for elem in elements:
+                        text = elem.get_text(strip=True)
+                        if len(text) > 100:
+                            abstract_text = text
+                            break
+                    if abstract_text:
+                        break
+                break
+
+        # Try generic fallback selectors
+        if not abstract_text:
+            for selector in GENERIC_ABSTRACT_SELECTORS:
+                if selector.startswith('meta'):
+                    # Meta tag selectors
+                    meta = soup.select_one(selector)
+                    if meta and meta.get('content'):
+                        text = meta.get('content', '').strip()
+                        if len(text) > 100:
+                            abstract_text = text
+                            break
+                else:
+                    elements = soup.select(selector)
+                    for elem in elements:
+                        text = elem.get_text(strip=True)
+                        if len(text) > 100:
+                            abstract_text = text
+                            break
+                    if abstract_text:
+                        break
+
+        # Try broader patterns: any element with 'abstract' in class/id
+        if not abstract_text:
+            for elem in soup.find_all(attrs={'class': re.compile(r'abstract', re.I)}):
+                text = elem.get_text(strip=True)
+                if len(text) > 100:
+                    abstract_text = text
+                    break
+            if not abstract_text:
+                for elem in soup.find_all(attrs={'id': re.compile(r'abstract', re.I)}):
+                    text = elem.get_text(strip=True)
+                    if len(text) > 100:
+                        abstract_text = text
+                        break
+
+        if abstract_text:
+            abstract_text = strip_html_tags(abstract_text)
+            abstract_text = ' '.join(abstract_text.split())
+            abstract_text = re.sub(r'^(Abstract|Summary|ABSTRACT|SUMMARY):?\s*', '', abstract_text)
+            result['abstract'] = abstract_text.strip()[:3000]
+            result['has_abstract'] = len(result['abstract']) > 50
+            if not result['has_abstract']:
+                result['failure_reason'] = 'doi_resolution_no_abstract'
+        else:
+            result['failure_reason'] = 'doi_resolution_no_abstract'
+
+        result['success'] = True
+
+    except requests.exceptions.Timeout:
+        result['error'] = 'Request timeout'
+        result['failure_reason'] = 'doi_resolution_timeout'
+    except requests.exceptions.ConnectionError as e:
+        result['error'] = f'Connection error: {str(e)[:100]}'
+        result['failure_reason'] = 'doi_resolution_redirect_failed'
+    except requests.exceptions.RequestException as e:
+        result['error'] = f'Request error: {str(e)[:100]}'
+        result['failure_reason'] = 'doi_resolution_redirect_failed'
+    except Exception as e:
+        result['error'] = f'Unexpected error: {str(e)[:100]}'
+        result['failure_reason'] = 'doi_resolution_redirect_failed'
+
+    return result
+
+
 def create_selenium_browser():
     """
     Create a headless Chrome browser for SSRN scraping.
@@ -1528,7 +1960,19 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         'nber_fetched': 0,
         'nber_recovered': 0,
         'nber_failed': 0,
-        'nber_no_abstract': 0
+        'nber_no_abstract': 0,
+        'semantic_scholar_fetched': 0,
+        'semantic_scholar_recovered': 0,
+        'semantic_scholar_failed': 0,
+        'semantic_scholar_no_abstract': 0,
+        'europepmc_fetched': 0,
+        'europepmc_recovered': 0,
+        'europepmc_failed': 0,
+        'europepmc_no_abstract': 0,
+        'doi_resolution_fetched': 0,
+        'doi_resolution_recovered': 0,
+        'doi_resolution_failed': 0,
+        'doi_resolution_no_abstract': 0
     }
 
     # Store raw responses for debugging
@@ -1544,7 +1988,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     # STEP 1: Try CrossRef API for all papers with DOIs (parallelized)
     # =========================================================================
     if len(to_fetch_crossref) > 0:
-        print(f"\n[Step 1/5] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers ({MAX_WORKERS_CROSSREF} workers)...")
+        print(f"\n[Step 1/8] Fetching abstracts from CrossRef for {len(to_fetch_crossref)} papers ({MAX_WORKERS_CROSSREF} workers)...")
 
         progress = ProgressCounter(len(to_fetch_crossref), "CrossRef")
         crossref_results = []  # Collect (df_idx, result, doi, title) tuples
@@ -1633,7 +2077,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     to_fetch_oa = df[still_missing_mask & has_oa_url_mask]
 
     if len(to_fetch_oa) > 0:
-        print(f"\n[Step 2/5] Scraping abstracts from Open Access URLs for {len(to_fetch_oa)} papers ({MAX_WORKERS_OA} workers)...")
+        print(f"\n[Step 2/8] Scraping abstracts from Open Access URLs for {len(to_fetch_oa)} papers ({MAX_WORKERS_OA} workers)...")
 
         # Track PDFs and JavaScript-required pages for later processing
         pdf_urls_to_process = []
@@ -1733,7 +2177,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         # STEP 2b: Try PDF extraction for detected PDF URLs
         # =========================================================================
         if len(pdf_urls_to_process) > 0 and PDF_EXTRACTION_AVAILABLE:
-            print(f"\n[Step 2b/5] Extracting abstracts from {len(pdf_urls_to_process)} PDF files ({MAX_WORKERS_PDF} workers)...")
+            print(f"\n[Step 2b/8] Extracting abstracts from {len(pdf_urls_to_process)} PDF files ({MAX_WORKERS_PDF} workers)...")
 
             progress_pdf = ProgressCounter(len(pdf_urls_to_process), "PDF", report_every=20)
             pdf_results = []
@@ -1791,7 +2235,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         # STEP 2c: Try Selenium for JavaScript-required pages
         # =========================================================================
         if len(js_urls_to_process) > 0:
-            print(f"\n[Step 2c/5] Processing {len(js_urls_to_process)} JavaScript-rendered pages with Selenium ({MAX_WORKERS_SELENIUM} workers)...")
+            print(f"\n[Step 2c/8] Processing {len(js_urls_to_process)} JavaScript-rendered pages with Selenium ({MAX_WORKERS_SELENIUM} workers)...")
             print("  Initializing Selenium browser pool...")
 
             # Initialize stats for JS/Selenium
@@ -1893,7 +2337,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     to_fetch_ssrn = df[still_missing_mask & is_ssrn]
 
     if len(to_fetch_ssrn) > 0:
-        print(f"\n[Step 3/5] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers ({MAX_WORKERS_SSRN} workers)...")
+        print(f"\n[Step 3/8] Scraping abstracts from SSRN for {len(to_fetch_ssrn)} papers ({MAX_WORKERS_SSRN} workers)...")
         print("  Initializing Selenium browser pool...")
 
         # Create Selenium browser pool for SSRN scraping
@@ -2060,7 +2504,7 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     nber_responses = []
 
     if len(to_fetch_nber) > 0:
-        print(f"\n[Step 4/5] Fetching full abstracts from NBER website for {len(to_fetch_nber)} papers ({MAX_WORKERS_NBER} workers)...")
+        print(f"\n[Step 4/8] Fetching full abstracts from NBER website for {len(to_fetch_nber)} papers ({MAX_WORKERS_NBER} workers)...")
 
         progress_nber = ProgressCounter(len(to_fetch_nber), "NBER", report_every=20)
         nber_worker_results = []  # (df_idx, result_or_none, url, title, nber_id)
@@ -2150,9 +2594,250 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
     print(f"  Saved NBER responses to: {nber_file}")
 
     # =========================================================================
-    # STEP 5: Save detailed failure log for diagnostic analysis
+    # STEP 5: Semantic Scholar API for papers with DOIs still missing abstracts
     # =========================================================================
-    print(f"\n[Step 5/5] Saving detailed failure log...")
+    still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
+    has_doi_mask = df['doi'].notna() & (df['doi'] != '')
+    to_fetch_ss = df[still_missing_mask & has_doi_mask]
+
+    semantic_scholar_responses = []
+
+    if len(to_fetch_ss) > 0:
+        print(f"\n[Step 5/8] Fetching abstracts from Semantic Scholar for {len(to_fetch_ss)} papers ({MAX_WORKERS_SEMANTIC_SCHOLAR} workers)...")
+
+        progress_ss = ProgressCounter(len(to_fetch_ss), "SemanticScholar")
+        ss_worker_results = []
+
+        def fetch_ss_one(df_idx, row):
+            doi = row['doi']
+            title = str(row.get('title', 'Unknown') or 'Unknown')[:50]
+            semantic_scholar_limiter.wait()
+            result = get_abstract_from_semantic_scholar(doi)
+            progress_ss.increment(recovered=result['success'] and result['has_abstract'])
+            return (df_idx, result, doi, title)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_SEMANTIC_SCHOLAR) as executor:
+            futures = {
+                executor.submit(fetch_ss_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_ss.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    ss_worker_results.append(future.result())
+                except Exception as e:
+                    print(f"    Semantic Scholar worker error: {e}")
+
+        # Batch-apply results
+        for df_idx, result, doi, title in ss_worker_results:
+            stats['semantic_scholar_fetched'] += 1
+
+            response_entry = {
+                'doi': doi,
+                'title': title,
+                'success': result['success'],
+                'has_abstract': result['has_abstract'],
+                'error': result['error'],
+                'failure_reason': result.get('failure_reason'),
+                'abstract_preview': result['abstract'][:100] if result['abstract'] else None
+            }
+            semantic_scholar_responses.append(response_entry)
+
+            if result['success'] and result['has_abstract']:
+                df.at[df_idx, 'abstract'] = result['abstract']
+                df.at[df_idx, 'abstract_source'] = 'SemanticScholar'
+                stats['semantic_scholar_recovered'] += 1
+            elif result['success'] and not result['has_abstract']:
+                stats['semantic_scholar_no_abstract'] += 1
+                all_failures.append({
+                    'source': 'SemanticScholar',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'semantic_scholar_no_abstract'),
+                    'error': result.get('error')
+                })
+            else:
+                stats['semantic_scholar_failed'] += 1
+                all_failures.append({
+                    'source': 'SemanticScholar',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'semantic_scholar_api_error'),
+                    'error': result.get('error')
+                })
+
+        print(f"  Semantic Scholar completed: {stats['semantic_scholar_fetched']} fetched, {stats['semantic_scholar_recovered']} recovered")
+
+    # Save Semantic Scholar responses
+    ss_file = os.path.join(TMP_DIR, "semantic_scholar_responses.json")
+    with open(ss_file, 'w') as f:
+        json.dump(semantic_scholar_responses, f, indent=2)
+    print(f"  Saved Semantic Scholar responses to: {ss_file}")
+
+    # =========================================================================
+    # STEP 6: Europe PMC API for papers still missing abstracts
+    # =========================================================================
+    still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
+    has_doi_mask = df['doi'].notna() & (df['doi'] != '')
+    to_fetch_epmc = df[still_missing_mask & (has_doi_mask | (df['title'].notna() & (df['title'] != '')))]
+
+    europepmc_responses = []
+
+    if len(to_fetch_epmc) > 0:
+        print(f"\n[Step 6/8] Fetching abstracts from Europe PMC for {len(to_fetch_epmc)} papers ({MAX_WORKERS_EUROPEPMC} workers)...")
+
+        progress_epmc = ProgressCounter(len(to_fetch_epmc), "EuropePMC")
+        epmc_worker_results = []
+
+        def fetch_epmc_one(df_idx, row):
+            doi = row.get('doi', '') or ''
+            title = str(row.get('title', 'Unknown') or 'Unknown')
+            title_short = title[:50]
+            europepmc_limiter.wait()
+            result = get_abstract_from_europepmc(doi, title=title)
+            progress_epmc.increment(recovered=result['success'] and result['has_abstract'])
+            return (df_idx, result, doi, title_short)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_EUROPEPMC) as executor:
+            futures = {
+                executor.submit(fetch_epmc_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_epmc.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    epmc_worker_results.append(future.result())
+                except Exception as e:
+                    print(f"    Europe PMC worker error: {e}")
+
+        # Batch-apply results
+        for df_idx, result, doi, title in epmc_worker_results:
+            stats['europepmc_fetched'] += 1
+
+            response_entry = {
+                'doi': doi,
+                'title': title,
+                'success': result['success'],
+                'has_abstract': result['has_abstract'],
+                'error': result['error'],
+                'failure_reason': result.get('failure_reason'),
+                'abstract_preview': result['abstract'][:100] if result['abstract'] else None
+            }
+            europepmc_responses.append(response_entry)
+
+            if result['success'] and result['has_abstract']:
+                df.at[df_idx, 'abstract'] = result['abstract']
+                df.at[df_idx, 'abstract_source'] = 'EuropePMC'
+                stats['europepmc_recovered'] += 1
+            elif result['success'] and not result['has_abstract']:
+                stats['europepmc_no_abstract'] += 1
+                all_failures.append({
+                    'source': 'EuropePMC',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'europepmc_no_abstract'),
+                    'error': result.get('error')
+                })
+            else:
+                stats['europepmc_failed'] += 1
+                all_failures.append({
+                    'source': 'EuropePMC',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'europepmc_api_error'),
+                    'error': result.get('error')
+                })
+
+        print(f"  Europe PMC completed: {stats['europepmc_fetched']} fetched, {stats['europepmc_recovered']} recovered")
+
+    # Save Europe PMC responses
+    epmc_file = os.path.join(TMP_DIR, "europepmc_responses.json")
+    with open(epmc_file, 'w') as f:
+        json.dump(europepmc_responses, f, indent=2)
+    print(f"  Saved Europe PMC responses to: {epmc_file}")
+
+    # =========================================================================
+    # STEP 7: DOI Resolution + Publisher Page Scraping
+    # =========================================================================
+    still_missing_mask = (df['abstract'].isna()) | (df['abstract'] == '')
+    has_doi_mask = df['doi'].notna() & (df['doi'] != '')
+    to_fetch_doi = df[still_missing_mask & has_doi_mask]
+
+    doi_resolution_responses = []
+
+    if len(to_fetch_doi) > 0:
+        print(f"\n[Step 7/8] Scraping abstracts from publisher pages via DOI resolution for {len(to_fetch_doi)} papers ({MAX_WORKERS_DOI_RESOLUTION} workers)...")
+
+        progress_doi = ProgressCounter(len(to_fetch_doi), "DOI Resolution")
+        doi_worker_results = []
+
+        def fetch_doi_one(df_idx, row):
+            doi = row['doi']
+            title = str(row.get('title', 'Unknown') or 'Unknown')[:50]
+            doi_resolution_limiter.wait()
+            result = get_abstract_from_doi_resolution(doi)
+            progress_doi.increment(recovered=result['success'] and result['has_abstract'])
+            return (df_idx, result, doi, title)
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_DOI_RESOLUTION) as executor:
+            futures = {
+                executor.submit(fetch_doi_one, df_idx, row): df_idx
+                for df_idx, row in to_fetch_doi.iterrows()
+            }
+            for future in as_completed(futures):
+                try:
+                    doi_worker_results.append(future.result())
+                except Exception as e:
+                    print(f"    DOI resolution worker error: {e}")
+
+        # Batch-apply results
+        for df_idx, result, doi, title in doi_worker_results:
+            stats['doi_resolution_fetched'] += 1
+
+            response_entry = {
+                'doi': doi,
+                'title': title,
+                'success': result['success'],
+                'has_abstract': result['has_abstract'],
+                'error': result['error'],
+                'failure_reason': result.get('failure_reason'),
+                'abstract_preview': result['abstract'][:100] if result['abstract'] else None
+            }
+            doi_resolution_responses.append(response_entry)
+
+            if result['success'] and result['has_abstract']:
+                df.at[df_idx, 'abstract'] = result['abstract']
+                df.at[df_idx, 'abstract_source'] = 'DOI_Publisher'
+                stats['doi_resolution_recovered'] += 1
+            elif result['success'] and not result['has_abstract']:
+                stats['doi_resolution_no_abstract'] += 1
+                all_failures.append({
+                    'source': 'DOI_Publisher',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'doi_resolution_no_abstract'),
+                    'error': result.get('error')
+                })
+            else:
+                stats['doi_resolution_failed'] += 1
+                all_failures.append({
+                    'source': 'DOI_Publisher',
+                    'paper_title': title,
+                    'doi': doi,
+                    'failure_reason': result.get('failure_reason', 'doi_resolution_redirect_failed'),
+                    'error': result.get('error')
+                })
+
+        print(f"  DOI Resolution completed: {stats['doi_resolution_fetched']} fetched, {stats['doi_resolution_recovered']} recovered")
+
+    # Save DOI Resolution responses
+    doi_file = os.path.join(TMP_DIR, "doi_resolution_responses.json")
+    with open(doi_file, 'w') as f:
+        json.dump(doi_resolution_responses, f, indent=2)
+    print(f"  Saved DOI Resolution responses to: {doi_file}")
+
+    # =========================================================================
+    # STEP 8: Save detailed failure log for diagnostic analysis
+    # =========================================================================
+    print(f"\n[Step 8/8] Saving detailed failure log...")
 
     # Aggregate failure statistics by reason
     failure_stats = {}
@@ -2188,7 +2873,10 @@ def complement_abstracts(df, delay=0.1, oa_delay=0.5, ssrn_delay=1.0):
         stats['pdf_recovered'] +
         stats.get('selenium_recovered', 0) +
         stats['ssrn_recovered'] +
-        stats['nber_recovered']
+        stats['nber_recovered'] +
+        stats['semantic_scholar_recovered'] +
+        stats['europepmc_recovered'] +
+        stats['doi_resolution_recovered']
     )
 
     return df, stats
@@ -2241,6 +2929,9 @@ def process_policy(policy_abbr):
     print(f"    Abstracts recovered from Selenium (JS pages): {stats.get('selenium_recovered', 0)}")
     print(f"    Abstracts recovered from SSRN: {stats['ssrn_recovered']}")
     print(f"    Abstracts recovered from NBER (full): {stats['nber_recovered']}")
+    print(f"    Abstracts recovered from Semantic Scholar: {stats['semantic_scholar_recovered']}")
+    print(f"    Abstracts recovered from Europe PMC: {stats['europepmc_recovered']}")
+    print(f"    Abstracts recovered from DOI Resolution: {stats['doi_resolution_recovered']}")
     print(f"    Total recovered: {stats['total_recovered']}")
     print(f"    Papers with abstracts after complementing: {after_complement_with_abstract}")
     print(f"    Papers still missing abstracts: {len(df_complemented) - after_complement_with_abstract}")
@@ -2309,6 +3000,9 @@ def process_policy(policy_abbr):
         'abstracts_from_selenium': int((df_complemented['abstract_source'] == 'Selenium').sum()),
         'abstracts_from_ssrn': int((df_complemented['abstract_source'] == 'SSRN').sum()),
         'abstracts_from_nber': int((df_complemented['abstract_source'] == 'NBER').sum()),
+        'abstracts_from_semantic_scholar': int((df_complemented['abstract_source'] == 'SemanticScholar').sum()),
+        'abstracts_from_europepmc': int((df_complemented['abstract_source'] == 'EuropePMC').sum()),
+        'abstracts_from_doi_publisher': int((df_complemented['abstract_source'] == 'DOI_Publisher').sum()),
         'still_missing_after_complement': int(len(df_complemented) - after_complement_with_abstract),
         'relevance_filter': {
             'before_filter': pre_filter_count,
@@ -2325,7 +3019,10 @@ def process_policy(policy_abbr):
         'pdf_stats': {k: v for k, v in stats.items() if k.startswith('pdf_')},
         'selenium_stats': {k: v for k, v in stats.items() if k.startswith('selenium_')},
         'ssrn_stats': {k: v for k, v in stats.items() if k.startswith('ssrn_')},
-        'nber_stats': {k: v for k, v in stats.items() if k.startswith('nber_')}
+        'nber_stats': {k: v for k, v in stats.items() if k.startswith('nber_')},
+        'semantic_scholar_stats': {k: v for k, v in stats.items() if k.startswith('semantic_scholar_')},
+        'europepmc_stats': {k: v for k, v in stats.items() if k.startswith('europepmc_')},
+        'doi_resolution_stats': {k: v for k, v in stats.items() if k.startswith('doi_resolution_')}
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_complement_metadata.json")
@@ -2399,12 +3096,16 @@ def main():
         crossref = result['abstracts_from_crossref']
         openaccess = result['abstracts_from_openaccess']
         ssrn = result['abstracts_from_ssrn']
-        initial = result['initial_papers']
+        nber = result.get('abstracts_from_nber', 0)
+        sem_scholar = result.get('abstracts_from_semantic_scholar', 0)
+        epmc = result.get('abstracts_from_europepmc', 0)
+        doi_pub = result.get('abstracts_from_doi_publisher', 0)
         final = result['final_papers']
         final_with_abs = result['final_with_abstract']
         filtered = result['relevance_filter']['filtered_with_abstract']
         print(f"  {abbr}:")
-        print(f"    Recovered: CrossRef={crossref}, OpenAccess={openaccess}, SSRN={ssrn}")
+        print(f"    Recovered: CrossRef={crossref}, OpenAccess={openaccess}, SSRN={ssrn}, NBER={nber}")
+        print(f"               SemanticScholar={sem_scholar}, EuropePMC={epmc}, DOI_Publisher={doi_pub}")
         print(f"    Filtered out (no search term match): {filtered}")
         print(f"    Final: {final} papers ({final_with_abs} with abstracts)")
 

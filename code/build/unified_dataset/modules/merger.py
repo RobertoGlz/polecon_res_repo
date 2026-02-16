@@ -125,11 +125,15 @@ def resolve_conflicts(rows: List[Dict], dataframes: Dict[str, pd.DataFrame]) -> 
     merged['venue'] = venues[0] if venues else None
 
     # === Aggregate Search Terms ===
+    # Scrapers store pipe-separated search terms in 'search_terms_matched'
     all_terms = set()
     for data in source_data:
-        term = data.get('search_term')
-        if term and pd.notna(term):
-            all_terms.add(term)
+        terms_str = data.get('search_terms_matched')
+        if terms_str and pd.notna(terms_str):
+            for term in str(terms_str).split('|'):
+                term = term.strip()
+                if term:
+                    all_terms.add(term)
     merged['search_terms'] = ' | '.join(sorted(all_terms)) if all_terms else None
 
     # === Source Indicators ===
