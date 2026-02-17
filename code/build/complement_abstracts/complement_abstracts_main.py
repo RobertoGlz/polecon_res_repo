@@ -319,14 +319,50 @@ def load_search_terms(policy_abbr):
     return search_terms
 
 
+def _is_acronym(term):
+    """Check if a search term is a short acronym (e.g., ACA, TCJA, NCLB)."""
+    return len(term) <= 5 and term.isupper() and term.isalpha()
+
+
+def _build_term_matchers(search_terms):
+    """
+    Pre-compile matchers for each search term.
+
+    Acronyms (short, all-uppercase like ACA, TCJA, NCLB) get whole-word,
+    case-sensitive regex matching to avoid false positives from substrings
+    (e.g., "aca" inside "academic").
+
+    Longer terms get standard case-insensitive substring matching.
+
+    Returns:
+    --------
+    list of (term, match_fn) tuples
+    """
+    matchers = []
+    for term in search_terms:
+        if _is_acronym(term):
+            # Whole-word, case-sensitive: matches "ACA", "(ACA)", "ACA's"
+            # but NOT "academic", "vacancy"
+            pattern = re.compile(r'\b' + re.escape(term) + r'\b')
+            matchers.append((term, lambda text_orig, p=pattern: bool(p.search(text_orig))))
+        else:
+            # Case-insensitive substring match for longer terms
+            term_lower = term.lower()
+            matchers.append((term, lambda text_lower, t=term_lower: t in text_lower))
+    return matchers
+
+
 def filter_by_relevance(df, search_terms):
     """
     Filter papers by relevance based on search term presence in title/abstract.
 
     Logic:
     - If paper has title AND abstract: keep only if at least one search term
-      appears in either title or abstract (case-insensitive)
+      appears in either title or abstract
     - If paper has only title (no abstract): keep the paper
+    - Acronym terms (e.g., ACA, TCJA) use whole-word case-sensitive matching
+      to avoid false positives from substrings like "academic"
+    - Longer terms use case-insensitive substring matching
 
     Parameters:
     -----------
@@ -344,6 +380,11 @@ def filter_by_relevance(df, search_terms):
     if len(df) == 0 or len(search_terms) == 0:
         return df, {'kept': len(df), 'filtered_with_abstract': 0, 'kept_no_abstract': 0}
 
+    matchers = _build_term_matchers(search_terms)
+    acronym_terms = [t for t in search_terms if _is_acronym(t)]
+    if acronym_terms:
+        print(f"    Acronym terms (whole-word, case-sensitive matching): {acronym_terms}")
+
     stats = {
         'kept': 0,
         'filtered_with_abstract': 0,
@@ -352,11 +393,13 @@ def filter_by_relevance(df, search_terms):
     }
 
     def is_relevant(row):
-        title = str(row.get('title', '')).lower()
-        abstract = str(row.get('abstract', '')).lower()
+        title = str(row.get('title', ''))
+        abstract = str(row.get('abstract', ''))
+        abstract_lower = abstract.lower()
 
         # Check if abstract is missing/empty
-        has_abstract = abstract and abstract != 'nan' and abstract.strip() != '' and abstract != 'none'
+        has_abstract = (abstract_lower and abstract_lower != 'nan'
+                        and abstract_lower.strip() != '' and abstract_lower != 'none')
 
         if not has_abstract:
             # No abstract - keep the paper
@@ -364,12 +407,19 @@ def filter_by_relevance(df, search_terms):
             return True
 
         # Has abstract - check for search term presence
-        text = title + ' ' + abstract
-        for term in search_terms:
-            term_lower = term.lower()
-            if term_lower in text:
-                stats['kept_with_abstract_match'] += 1
-                return True
+        text_orig = title + ' ' + abstract
+        text_lower = text_orig.lower()
+        for term, match_fn in matchers:
+            # Acronym matchers receive the original-case text;
+            # substring matchers receive the lowercased text
+            if _is_acronym(term):
+                if match_fn(text_orig):
+                    stats['kept_with_abstract_match'] += 1
+                    return True
+            else:
+                if match_fn(text_lower):
+                    stats['kept_with_abstract_match'] += 1
+                    return True
 
         # Has abstract but no search term match - filter out
         stats['filtered_with_abstract'] += 1
