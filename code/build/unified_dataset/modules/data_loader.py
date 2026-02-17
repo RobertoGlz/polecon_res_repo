@@ -26,7 +26,7 @@ STANDARD_COLUMNS = {
     'cited_by_count': 'cited_by_count',
     'is_open_access': 'is_open_access',
     'open_access_url': 'open_access_url',
-    'search_term': 'search_term',
+    'search_terms_matched': 'search_terms_matched',
     'policy_studied': 'policy_studied',
     'policy_year': 'policy_year',
     'policy_abbreviation': 'policy_abbreviation',
