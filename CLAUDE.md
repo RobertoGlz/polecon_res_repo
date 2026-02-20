@@ -38,11 +38,36 @@ All scrapers support `--resume` and `python script.py [POLICY ...]` for selectiv
 
 ## Git & GitHub Workflow
 
-- **Commit messages**: `#<issue> <Description>` (e.g., `#7 Extend abstract recovery pipeline`)
-- **Branches**: Feature branches named `i#<issue>_<short_description>`, merged via PR
-- **Issues**: Each pipeline stage and enhancement is tracked as a GitHub issue
+Each task is associated to a GitHub issue and worked on in a dedicated local branch.
+
+### Branch naming
+
+`i#N_some_name` where `N` is the issue number and `some_name` is a short description.
+Example: `i#7_abstract_recovery`
+
+### Commit messages
+
+Reference the issue at the beginning: `#N <Description>`
+Example: `#7 Extend abstract recovery pipeline`
+
+### Workflow
+
+1. Create a feature branch from `main`: `git checkout -b i#N_some_name`
+2. Work on the task, then stage and commit: `git add <files> && git commit -m "#N Description"`
+3. Push and create a pull request if needed: `git push -u origin i#N_some_name`
+4. After the PR is merged, clean up:
+   ```bash
+   git fetch --all --prune && git checkout main && git pull origin main && git push origin --delete i#N_some_name && git branch -D i#N_some_name
+   ```
+
+### What to commit / not commit
+
 - **Do not commit**: `.env`, data files (CSV/JSON/Parquet), `output/`, `tmp/` — all in `.gitignore`
 - **Do commit**: Python scripts, Markdown reports in `code/build/*/reports/`, `requirements.txt`
+
+### Issues
+
+- Each pipeline stage and enhancement is tracked as a GitHub issue
 - When commenting on issues, include tables with quantitative results and flag next steps
 
 ## Code Style
