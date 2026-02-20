@@ -326,6 +326,57 @@ def normalize_title(title):
     return title
 
 
+def validate_acronym_matches(df):
+    """
+    For papers matched only by short all-caps acronyms (e.g., 'ACA'),
+    validate that the acronym appears case-sensitively as a whole word
+    in the title or abstract. Drop papers that fail validation.
+
+    Returns:
+        (filtered_df, n_dropped)
+    """
+    if 'search_terms_matched' not in df.columns:
+        return df, 0
+
+    # Identify which search terms are short all-caps acronyms
+    all_terms = set()
+    for val in df['search_terms_matched'].dropna():
+        for t in str(val).split('|'):
+            all_terms.add(t.strip())
+    acronyms = {t for t in all_terms if len(t) <= 4 and t == t.upper() and t.isalpha()}
+
+    if not acronyms:
+        return df, 0
+
+    print(f"    Case-sensitive validation for acronyms: {acronyms}")
+
+    # Build combined text from title + abstract
+    text = df['title'].fillna('').astype(str) + ' ' + df['abstract'].fillna('').astype(str)
+
+    # Check if any acronym appears case-sensitively as a whole word
+    acronym_found = pd.Series(False, index=df.index)
+    for acr in acronyms:
+        acronym_found = acronym_found | text.str.contains(
+            r'\b' + re.escape(acr) + r'\b', regex=True, na=False
+        )
+
+    # Check if paper has any non-acronym search term (always keep these)
+    def has_regular_term(terms_str):
+        terms = [t.strip() for t in str(terms_str).split('|')]
+        return any(t not in acronyms for t in terms if t)
+
+    has_regular = df['search_terms_matched'].apply(has_regular_term)
+
+    # Keep: has a regular term OR passes case-sensitive check
+    keep = has_regular | acronym_found
+    n_dropped = int((~keep).sum())
+
+    if n_dropped > 0:
+        print(f"    Acronym filter: dropped {n_dropped} of {len(df)} papers ({n_dropped/len(df)*100:.1f}%)")
+
+    return df[keep].copy(), n_dropped
+
+
 def compare_with_openalex(policy_abbr):
     """
     Compare Semantic Scholar papers with OpenAlex coverage.
@@ -635,6 +686,9 @@ def process_policy(policy_row):
     duplicate_count = initial_count - len(df_unique)
     print(f"    Initial: {initial_count} | Duplicates: {duplicate_count} | Unique: {len(df_unique)}")
 
+    # Case-sensitive validation for short acronym search terms
+    df_unique, acronym_filtered_count = validate_acronym_matches(df_unique)
+
     # Filter out papers published before the policy year
     print(f"\n  Filtering papers by publication date (>= {policy_year})...")
     pre_filter_count = len(df_unique)
@@ -681,6 +735,7 @@ def process_policy(policy_row):
         'scrape_date': datetime.now().isoformat(),
         'total_papers_found': initial_count,
         'duplicates_removed': duplicate_count,
+        'acronym_filtered': acronym_filtered_count,
         'pre_policy_filtered': filtered_count,
         'unique_papers_raw': len(df_unique),
         'note': 'Raw data without relevance filtering. Filtering applied after abstract recovery.',
