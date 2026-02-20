@@ -1,6 +1,6 @@
 # OpenAlex Report: TCJA
 
-**Generated:** 2026-02-09 02:44:48
+**Generated:** 2026-02-19 20:26:30
 
 ---
 
@@ -8,10 +8,10 @@
 
 | Metric | Value |
 |--------|-------|
-| Total Papers | 10874 |
-| Papers with Abstract | 7.2% |
-| Papers with DOI | 71.4% |
-| Papers with Open Access URL | 93.6% |
+| Total Papers | 9435 |
+| Papers with Abstract | 8.7% |
+| Papers with DOI | 67.0% |
+| Papers with Open Access URL | 93.2% |
 | Year Range | 2017-2026 |
 | Median Citations | 0.0 |
 

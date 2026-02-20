@@ -1,6 +1,6 @@
 # Unified Dataset Summary Report
 
-**Generated:** 2026-02-09 02:45:59
+**Generated:** 2026-02-19 20:27:32
 
 This report summarizes the unified policy papers dataset created from
 OpenAlex, Semantic Scholar, and NBER sources.
@@ -11,14 +11,14 @@ OpenAlex, Semantic Scholar, and NBER sources.
 
 | Policy | Total Papers | In OpenAlex | In Semantic Scholar | In NBER | In All Sources | With Abstract |
 |--------|--------------|-------------|---------------------|---------|----------------|---------------|
-| TCJA | 11930 | 10856 | 1256 | 48 | 1 | 1092 (9.2%) |
-| ACA | 92394 | 89407 | 3551 | 135 | 11 | 53365 (57.8%) |
-| NCLB | 21838 | 19162 | 3197 | 37 | 4 | 7669 (35.1%) |
+| TCJA | 10500 | 9426 | 1256 | 48 | 1 | 1126 (10.7%) |
+| ACA | 54356 | 51361 | 3551 | 135 | 11 | 28234 (51.9%) |
+| NCLB | 18520 | 15844 | 3197 | 37 | 4 | 7829 (42.3%) |
 
 ## Overall Totals
 
-- **Total unique papers across all policies:** 126162
-- **Total papers with abstracts:** 62126 (49.2%)
+- **Total unique papers across all policies:** 83376
+- **Total papers with abstracts:** 37189 (44.6%)
 
 ## Key Findings
 

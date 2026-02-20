@@ -1,6 +1,6 @@
 # NBER Report: TCJA
 
-**Generated:** 2026-02-09 02:44:48
+**Generated:** 2026-02-19 20:26:30
 
 ---
 

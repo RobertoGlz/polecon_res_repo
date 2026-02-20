@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Research project studying how major U.S. policies generate academic research. We systematically collect papers evaluating three policies (TCJA, ACA, NCLB), recover missing metadata, build unified datasets, and classify papers by whether they empirically evaluate policy effects on economic outcomes.
+Research project about the political economy of research. We are interested in studying whether research done by different agents (e.g., government, think-tanks, academics, etc) systematically produce different estimates when analyzing the same policy. To do this, we need to get the set of research documents that study the effect of a given policy on economic outcomes.
 
 ## Pipeline Architecture
 
