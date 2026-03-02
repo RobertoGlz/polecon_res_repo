@@ -11,6 +11,7 @@ Usage:
     python unify_econ_datasets_main.py TCJA
 """
 
+import html
 import json
 import os
 import re
@@ -57,10 +58,15 @@ TOP10_ECON_JOURNALS = {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def normalize_title(title):
-    """Normalize title for matching: lowercase, no punctuation, normalized whitespace."""
+    """Normalize title for matching: strip HTML, decode entities, lowercase, no punctuation."""
     if not title or pd.isna(title):
         return ''
-    title = str(title).lower()
+    title = str(title)
+    title = re.sub(r'<[^>]+>', '', title)   # Strip HTML tags (<scp>, </scp>, etc.)
+    title = html.unescape(title)             # Decode HTML entities (&amp; → &)
+    title = title.lower()
+    title = title.replace('&', ' and ')      # Normalize & → and
+    title = re.sub(r'[\u2013\u2014-]+', ' ', title)  # Normalize dashes (en/em/hyphen) → space
     title = re.sub(r'[^\w\s]', '', title)
     title = ' '.join(title.split())
     return title
