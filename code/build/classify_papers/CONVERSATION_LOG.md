@@ -63,11 +63,49 @@ the effect of {policy} on an economic outcome?"
 
 ---
 
-### Prompt Iteration Notes
+### 2026-02-24 — Econ-Unified Dataset & Prompt Variants
 
-(Will be updated as we inspect pilot results and refine the prompt.)
+**Context:** Issue #24 produced EconLit (175 papers) and APIs (4,207 papers)
+datasets. Issue #22 continues with unification and classification.
+
+**Changes to classify_papers_main.py:**
+
+1. **v2 prompt variant** (`v2_no_examples`): Identical to v1 but removes the
+   parenthetical examples list from the TRUE criterion. Tests whether
+   explicit outcome examples bias the classifier.
+
+2. **New parameters**: `--prompt_version`, `--run_label`, `--input_dir`,
+   `--all`, `--merge` — enables reading from the econ-unified dataset and
+   running full classification with checkpoint/resume.
+
+3. **Econ-unified data source**: When `--input_dir` points to
+   `scrape_econ/output/`, reads `TCJA_econ_unified.parquet` and uses
+   `econ_unified_id` as the paper identifier.
+
+**Changes to Pipeline B (scrape_econ_apis_main.py):**
+
+4. **Enhanced abstract recovery**: Added 6 new sources beyond CrossRef + SS:
+   Europe PMC, OpenAlex re-fetch, OA URL scraping, PDF extraction, NBER
+   website scraping, SS title search, and Selenium (for JS-rendered pages).
+   Sources ordered by success rate based on complement_abstracts TCJA data.
+
+5. **NBER non-paper filter**: Drops conference listings, meeting agendas,
+   book front/back matter from NBER search results (~266 of 322 NBER
+   papers without abstracts are non-paper content).
+
+6. **Recovery now processes ALL papers** without abstracts, not just those
+   with DOIs. Previously ~1,300 papers without DOIs were skipped entirely.
+
+**Pilot results (6 runs on 15 papers):**
+
+(To be filled after running pilot classification.)
+
+---
+
+### Prompt Iteration Notes
 
 | Version | Change | Reason |
 |---------|--------|--------|
-| v1 | Initial prompt | Starting point |
+| v1 | Initial prompt with outcome examples | Starting point |
+| v2 | Removed parenthetical examples | Test prompt sensitivity |
 

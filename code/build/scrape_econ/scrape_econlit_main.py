@@ -145,6 +145,7 @@ class RateLimiter:
 
 crossref_rate_limiter = RateLimiter(CROSSREF_RATE_LIMIT)
 ss_rate_limiter = RateLimiter(SS_RATE_LIMIT)
+epmc_rate_limiter = RateLimiter(0.15)  # Europe PMC: ~7 req/sec
 
 
 # =============================================================================
@@ -1487,7 +1488,7 @@ def deduplicate(df):
 
 
 # =============================================================================
-# ABSTRACT RECOVERY (CrossRef + Semantic Scholar)
+# ABSTRACT RECOVERY (CrossRef + Semantic Scholar + Europe PMC)
 # =============================================================================
 def recover_abstract_crossref(doi):
     """Recover abstract from CrossRef API using DOI."""
@@ -1571,6 +1572,33 @@ def recover_abstract_crossref_title(title):
         return None, None, f'crossref_title_error: {str(e)[:80]}'
 
 
+def recover_abstract_epmc(doi):
+    """Recover abstract from Europe PMC API using DOI."""
+    clean_doi = normalize_doi(doi)
+    if not clean_doi:
+        return None, 'no_doi'
+    try:
+        epmc_rate_limiter.wait()
+        url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+        params = {
+            'query': f'DOI:"{clean_doi}"',
+            'format': 'json',
+            'resultType': 'core',
+            'pageSize': 1,
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None, f'epmc_http_{resp.status_code}'
+        results = resp.json().get('resultList', {}).get('result', [])
+        if results:
+            abstract = results[0].get('abstractText', '')
+            if abstract and len(abstract.strip()) > 50:
+                return abstract.strip(), None
+        return None, 'epmc_no_abstract'
+    except Exception as e:
+        return None, f'epmc_error: {str(e)[:80]}'
+
+
 def recover_missing_abstracts(df, checkpoint_path=None):
     """
     Recover missing abstracts and DOIs using CrossRef and Semantic Scholar.
@@ -1625,19 +1653,26 @@ def recover_missing_abstracts(df, checkpoint_path=None):
     t0 = time.time()
     for i, idx in enumerate(missing_indices):
         doi = df.loc[idx, 'doi']
-        # Try CrossRef first (faster)
+        # Try CrossRef first (18.1% success, fast)
         abstract, error = recover_abstract_crossref(doi)
         if abstract:
             df.loc[idx, 'abstract'] = abstract
             df.loc[idx, 'abstract_source'] = 'CrossRef'
             recovered += 1
         else:
-            # Try Semantic Scholar
-            abstract, error = recover_abstract_ss(doi)
+            # Try Europe PMC (11.2% success, fast)
+            abstract, error = recover_abstract_epmc(doi)
             if abstract:
                 df.loc[idx, 'abstract'] = abstract
-                df.loc[idx, 'abstract_source'] = 'SemanticScholar_recovery'
+                df.loc[idx, 'abstract_source'] = 'EuropePMC'
                 recovered += 1
+            else:
+                # Try Semantic Scholar (1.1% success, slow)
+                abstract, error = recover_abstract_ss(doi)
+                if abstract:
+                    df.loc[idx, 'abstract'] = abstract
+                    df.loc[idx, 'abstract_source'] = 'SemanticScholar_recovery'
+                    recovered += 1
         if (i + 1) == 20:
             elapsed = time.time() - t0
             rate = elapsed / 20
