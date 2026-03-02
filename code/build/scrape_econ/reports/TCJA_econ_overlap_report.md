@@ -1,18 +1,18 @@
 # Tax Cuts and Jobs Act (TCJA) — EconLit vs API Overlap Report
 
-Generated: 2026-02-24 13:03:17
+Generated: 2026-03-02 15:04:27
 
 ## Raw (after abstract recovery)
 
 | Metric | Count |
 |--------|------:|
 | Pipeline A (EconLit) | 175 |
-| Pipeline B (APIs) | 81,640 |
+| Pipeline B (APIs) | 81,293 |
 | Intersection | 147 |
 | — DOI matches | 125 |
 | — Title-only matches | 22 |
 | Unique to EconLit | 28 |
-| Unique to APIs | 81,426 |
+| Unique to APIs | 81,079 |
 | Jaccard similarity | 0.2% |
 | EconLit recall (% found in APIs) | 84.0% |
 
@@ -52,13 +52,12 @@ Generated: 2026-02-24 13:03:17
 
 | Data Sources | Count |
 |-------------|------:|
-| OpenAlex | SemanticScholar | 137 |
-| OpenAlex | 35 |
+| OpenAlex | SemanticScholar | 134 |
+| OpenAlex | 38 |
 | OpenAlex | SemanticScholar | NBER | 18 |
 | OpenAlex | NBER | 15 |
 | SemanticScholar | 5 |
-| NBER | 3 |
-| SemanticScholar | NBER | 1 |
+| NBER | 4 |
 
 ### Sample papers unique to EconLit (28 total)
 
@@ -77,7 +76,7 @@ Generated: 2026-02-24 13:03:17
   - DOI: 10.19172/kreaa.30.4.9
 - [2025] Essays on Multinational Behavior
 
-### Top-cited papers unique to APIs (81,426 total)
+### Top-cited papers unique to APIs (81,079 total)
 
 - [2018.0] High-quality health systems in the Sustainable Development Goals era: time for a revolution (cited: 3579.0, source: OpenAlex)
 - [2023.0] Opinion Paper: “So what if ChatGPT wrote it?” Multidisciplinary perspectives on opportunities, chall (cited: 3228.0, source: OpenAlex)
@@ -95,13 +94,13 @@ Generated: 2026-02-24 13:03:17
 | Metric | Count |
 |--------|------:|
 | Pipeline A (EconLit) | 175 |
-| Pipeline B (APIs) | 4,207 |
+| Pipeline B (APIs) | 3,071 |
 | Intersection | 142 |
 | — DOI matches | 124 |
 | — Title-only matches | 18 |
 | Unique to EconLit | 33 |
-| Unique to APIs | 4,006 |
-| Jaccard similarity | 3.4% |
+| Unique to APIs | 2,870 |
+| Jaccard similarity | 4.7% |
 | EconLit recall (% found in APIs) | 81.1% |
 
 ### By paper type
@@ -140,12 +139,12 @@ Generated: 2026-02-24 13:03:17
 
 | Data Sources | Count |
 |-------------|------:|
-| OpenAlex | SemanticScholar | 136 |
-| OpenAlex | 30 |
+| OpenAlex | SemanticScholar | 133 |
+| OpenAlex | 33 |
 | OpenAlex | SemanticScholar | NBER | 18 |
 | OpenAlex | NBER | 11 |
 | SemanticScholar | 5 |
-| SemanticScholar | NBER | 1 |
+| NBER | 1 |
 
 ### Sample papers unique to EconLit (33 total)
 
@@ -164,15 +163,15 @@ Generated: 2026-02-24 13:03:17
 - [2024] Home Selling and Tax Reform
   - DOI: 10.19172/kreaa.30.4.9
 
-### Top-cited papers unique to APIs (4,006 total)
+### Top-cited papers unique to APIs (2,870 total)
 
 - [2023.0] Opinion Paper: “So what if ChatGPT wrote it?” Multidisciplinary perspectives on opportunities, chall (cited: 3228.0, source: OpenAlex)
-- [2018.0] Canada's universal health-care system: achieving its potential (cited: 550.0, source: OpenAlex)
 - [2020.0] Rebirth of Industrial Policy and an Agenda for the Twenty-First Century (cited: 507.0, source: OpenAlex)
 - [2022.0] Global carbon inequality over 1990–2019 (cited: 487.0, source: OpenAlex)
-- [2021.0] A sustainable development pathway for climate action within the UN 2030 Agenda (cited: 486.0, source: OpenAlex)
 - [2018.0] Institutions, entrepreneurship, and economic growth in Europe (cited: 485.0, source: OpenAlex)
-- [2020.0] Economic development and converging household carbon footprints in China (cited: 435.0, source: OpenAlex)
-- [2017.0] Premium subsidies, the mandate, and Medicaid expansion: Coverage effects of the Affordable Care Act (cited: 432.0, source: OpenAlex)
-- [2020.0] Antecedents of Environmentally and Socially Responsible Sustainable Consumer Behavior (cited: 340.0, source: OpenAlex)
-- [2018.0] A literature review of sustainable consumption and production: A comparative analysis in developed a (cited: 329.0, source: OpenAlex)
+- [2018.0] The politics of accelerating low-carbon transitions: Towards a new research agenda (cited: 360.0, source: OpenAlex)
+- [2021.0] Disruption in global supply chain and socio-economic shocks: a lesson from COVID-19 for sustainable  (cited: 288.0, source: OpenAlex)
+- [2019.0] A roadmap for China to peak carbon dioxide emissions and achieve a 20% share of non-fossil fuels in  (cited: 273.0, source: OpenAlex)
+- [2019.0] Gigantism in container shipping, ports and global logistics: a time-lapse into the future (cited: 203.0, source: OpenAlex)
+- [2017.0] Examining the effect of external pressures and organizational culture on shaping performance measure (cited: 198.0, source: OpenAlex)
+- [2017.0] Capital misallocation in China: Financial frictions or policy distortions? (cited: 187.0, source: OpenAlex)

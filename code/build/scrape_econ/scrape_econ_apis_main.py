@@ -14,7 +14,9 @@ Pipeline Overview:
 3. Semantic Scholar: bulk search with fieldsOfStudy=Economics,Business
 4. NBER: standard search (already all economics)
 5. Merge across sources (DOI + title matching)
-6. Recover missing abstracts via CrossRef + Semantic Scholar APIs
+6. Recover missing abstracts via CrossRef, Semantic Scholar, Europe PMC,
+   OpenAlex re-fetch, OA URL scraping, PDF extraction, NBER website,
+   SS title search, and Selenium (for JS-rendered pages like SSRN)
 7. Apply relevance filtering (search terms in title/abstract)
 8. Save raw and filtered outputs
 
@@ -47,12 +49,40 @@ import json
 import pandas as pd
 import time
 import re
+import tempfile
 from datetime import datetime
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from dotenv import load_dotenv
+
+# PDF extraction — optional dependency
+try:
+    import pdfplumber
+    PDF_EXTRACTION_AVAILABLE = True
+except ImportError:
+    PDF_EXTRACTION_AVAILABLE = False
+
+# Selenium — optional dependency (for JS-rendered pages like SSRN)
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import TimeoutException, WebDriverException
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
+# undetected-chromedriver — optional dependency (for SSRN Cloudflare bypass)
+try:
+    import undetected_chromedriver as uc
+    from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
+    UC_AVAILABLE = True
+except ImportError:
+    UC_AVAILABLE = False
 
 # =============================================================================
 # PATHS
@@ -125,6 +155,17 @@ oa_rate_limiter = RateLimiter(OA_RATE_LIMIT)
 ss_rate_limiter = RateLimiter(SS_RATE_LIMIT)
 nber_rate_limiter = RateLimiter(NBER_RATE_LIMIT)
 crossref_rate_limiter = RateLimiter(CROSSREF_RATE_LIMIT)
+epmc_rate_limiter = RateLimiter(0.15)      # Europe PMC: ~7 req/sec
+oa_url_rate_limiter = RateLimiter(0.3)     # OA URL scraping: ~3 req/sec
+nber_web_rate_limiter = RateLimiter(0.5)   # NBER website: 2 req/sec
+
+# SSRN recovery configuration
+SSRN_PROFILE_DIR = os.path.join(
+    os.environ.get('LOCALAPPDATA', os.path.expanduser('~')),
+    'ssrn_selenium_profile'
+)
+SSRN_DELAY = 5             # Seconds between SSRN requests
+SSRN_CHECKPOINT_INTERVAL = 25  # Save checkpoint every N papers
 
 
 # =============================================================================
@@ -281,6 +322,81 @@ def validate_acronym_matches(df):
         print(f"    Acronym filter: dropped {n_dropped} of {len(df)} papers ({n_dropped/len(df)*100:.1f}%)")
 
     return df[keep].copy(), n_dropped
+
+
+def filter_nber_nonpapers(df):
+    """
+    Filter out NBER non-paper content: conference listings, meeting agendas,
+    lecture announcements, book front/back matter, discussion summaries, etc.
+
+    These entries come from the NBER search API and lack abstracts because
+    they are not research papers. Removing them avoids wasting classifier
+    API calls and prevents false positives from auto-passing relevance checks.
+
+    Only applied to NBER-sourced papers without abstracts.
+
+    Returns:
+        (filtered_df, n_dropped)
+    """
+    if 'in_nber' not in df.columns:
+        return df, 0
+
+    has_abstract = df['abstract'].fillna('').astype(str).str.len() > 50
+    is_nber = df['in_nber'].fillna(False).astype(bool)
+    candidates = ~has_abstract & is_nber
+
+    if candidates.sum() == 0:
+        return df, 0
+
+    nber_junk_pattern = re.compile(
+        r'^References\s*$'
+        r'|^Introduction to\s+"'
+        r'|^Introduction,\s+"'
+        r'|^Comment on\s+'
+        r'|^Comments\s*$'
+        r'|^Discussion of\s+'
+        r'|Discussant|Discussion summary'
+        r'|Front\s*matter|Back\s*matter|Prelim'
+        r'|^Index\s*$'
+        r'|^Acknowledgm'
+        r'|^Contributors'
+        r'|^Appendix'
+        r'|^Editorial in'
+        r'|^List of contributors'
+        r'|^Notes and References'
+        r'|Program Meeting'
+        r'|Working Group'
+        r'|Boot\s*[Cc]amp'
+        r'|^SI \d{4}\s'
+        r'|Summer Institute'
+        r'|Conference,\s+(Spring|Fall|Summer|Winter)\s+\d{4}'
+        r'|Seminar.*\d{4}'
+        r'|,\s+(Spring|Fall|Summer|Winter)\s+\d{4}\s*$'
+        r'|^\d{4}.*Lecture'
+        r'|^\d{4}.*Keynote'
+        r'|^\d{4},\s+.*Panel'
+        r'|^\d{4},\s+\w+\s+\w+,'
+        r'|^\d+(st|nd|rd|th)\s+(Annual\s+)?NBER'
+        r'|^\d+(st|nd|rd|th)\s+Entrepreneurship'
+        r'|^NBER Board'
+        r'|^Meeting on\s+'
+        r'|Panel Discussion:'
+        r'|NBER-TCER-CEPR'
+        r'|Annual Conference on Macroeconomics'
+        r'|Clambake'
+        r'|^Tax Policy and the Economy,\s+\d{4}',
+        re.IGNORECASE
+    )
+
+    is_junk = df['title'].fillna('').apply(lambda t: bool(nber_junk_pattern.search(t)))
+    drop_mask = candidates & is_junk
+    n_dropped = int(drop_mask.sum())
+
+    if n_dropped > 0:
+        print(f"    NBER non-paper filter: dropped {n_dropped} of {candidates.sum()} "
+              f"NBER papers without abstracts (conferences, meetings, book content)")
+
+    return df[~drop_mask].copy(), n_dropped
 
 
 def filter_by_relevance(df, search_terms):
@@ -1120,7 +1236,7 @@ def merge_sources(oa_df, ss_df, nber_df):
 
 
 # =============================================================================
-# ABSTRACT RECOVERY (lightweight: CrossRef + SS API)
+# ABSTRACT RECOVERY (CrossRef + SS + Europe PMC + OpenAlex + OA URL + NBER + SS title)
 # =============================================================================
 def recover_abstract_crossref(doi):
     """Recover abstract from CrossRef API using DOI."""
@@ -1187,35 +1303,812 @@ def recover_abstract_ss(doi):
         return None, f'ss_error: {str(e)[:80]}'
 
 
-def recover_single_paper(doi):
+def recover_abstract_epmc(doi):
+    """Recover abstract from Europe PMC API using DOI."""
+    clean_doi = normalize_doi(doi)
+    if not clean_doi:
+        return None, 'no_doi'
+    try:
+        epmc_rate_limiter.wait()
+        url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+        params = {
+            'query': f'DOI:"{clean_doi}"',
+            'format': 'json',
+            'resultType': 'core',
+            'pageSize': 1,
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code != 200:
+            return None, f'epmc_http_{resp.status_code}'
+        results = resp.json().get('resultList', {}).get('result', [])
+        if results:
+            abstract = results[0].get('abstractText', '')
+            if abstract and len(abstract.strip()) > 50:
+                return abstract.strip(), None
+        return None, 'epmc_no_abstract'
+    except Exception as e:
+        return None, f'epmc_error: {str(e)[:80]}'
+
+
+def recover_abstract_openalex(openalex_id):
+    """Re-fetch abstract from OpenAlex individual works endpoint by ID."""
+    if not openalex_id or pd.isna(openalex_id):
+        return None, 'no_openalex_id'
+    oa_id = str(openalex_id).strip()
+    if 'openalex.org' in oa_id:
+        oa_id = oa_id.split('/')[-1]
+    try:
+        oa_rate_limiter.wait()
+        url = f"https://api.openalex.org/works/{oa_id}"
+        resp = requests.get(url, params={'mailto': USER_EMAIL}, timeout=15)
+        if resp.status_code != 200:
+            return None, f'oa_refetch_http_{resp.status_code}'
+        work = resp.json()
+        abstract = reconstruct_abstract(work.get('abstract_inverted_index'))
+        if abstract and len(abstract.strip()) > 50:
+            return abstract.strip(), None
+        return None, 'oa_refetch_no_abstract'
+    except Exception as e:
+        return None, f'oa_refetch_error: {str(e)[:80]}'
+
+
+def _is_pdf_url(url):
+    """Check if URL points to a PDF file based on URL pattern."""
+    url_lower = url.lower()
+    return (url_lower.endswith('.pdf') or '/pdf/' in url_lower
+            or url_lower.endswith('/pdf'))
+
+
+def _requires_javascript(html):
+    """Detect if page content requires JavaScript to render."""
+    indicators = [
+        'React.createElement', '__NEXT_DATA__', 'ng-app=',
+        'data-reactroot', 'Please enable JavaScript',
+        'JavaScript is required', 'window.__INITIAL_STATE__',
+    ]
+    return any(ind in html for ind in indicators)
+
+
+def recover_abstract_oa_url(url_str):
     """
-    Recover abstract for a single paper: try CrossRef, then Semantic Scholar.
+    Scrape abstract from an open access URL (HTML page).
+
+    Returns (abstract, error_code). Special error codes:
+    - 'oa_url_is_pdf': URL points to a PDF (try PDF extraction)
+    - 'oa_url_javascript_required': page needs JS rendering (try Selenium)
+    """
+    if not url_str or pd.isna(url_str):
+        return None, 'no_oa_url'
+    url_str = str(url_str).strip()
+    if not url_str.startswith('http'):
+        return None, 'invalid_url'
+
+    # Check URL pattern for PDF before fetching
+    if _is_pdf_url(url_str):
+        return None, 'oa_url_is_pdf'
+
+    try:
+        oa_url_rate_limiter.wait()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+        }
+        resp = requests.get(url_str, headers=headers, timeout=20, allow_redirects=True)
+        if resp.status_code != 200:
+            return None, f'oa_url_http_{resp.status_code}'
+        content_type = resp.headers.get('content-type', '')
+        if 'pdf' in content_type.lower():
+            return None, 'oa_url_is_pdf'
+        html = resp.text
+        if len(html) < 200:
+            return None, 'oa_url_too_short'
+
+        # Detect JavaScript-rendered pages (e.g., SSRN)
+        if _requires_javascript(html):
+            return None, 'oa_url_javascript_required'
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        selectors = [
+            {'name': 'meta', 'attrs': {'name': 'citation_abstract'}},
+            {'name': 'meta', 'attrs': {'name': 'DC.description'}},
+            {'name': 'meta', 'attrs': {'name': 'description'}},
+            {'name': 'meta', 'attrs': {'property': 'og:description'}},
+            {'name': 'div', 'attrs': {'class': re.compile(r'abstract', re.I)}},
+            {'name': 'section', 'attrs': {'class': re.compile(r'abstract', re.I)}},
+            {'name': 'p', 'attrs': {'class': re.compile(r'abstract', re.I)}},
+            {'name': 'div', 'attrs': {'id': re.compile(r'abstract', re.I)}},
+            {'name': 'section', 'attrs': {'id': re.compile(r'abstract', re.I)}},
+        ]
+        for sel in selectors:
+            elem = soup.find(**sel)
+            if elem:
+                if elem.name == 'meta':
+                    text = elem.get('content', '')
+                else:
+                    text = elem.get_text(separator=' ', strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                text = re.sub(r'^Abstract[\s.:]*', '', text, flags=re.I).strip()
+                if len(text) > 50:
+                    return text, None
+        return None, 'oa_url_no_abstract'
+    except Exception as e:
+        return None, f'oa_url_error: {str(e)[:80]}'
+
+
+def recover_abstract_pdf(pdf_url):
+    """
+    Download PDF and extract abstract from the first 3 pages.
+    Uses pdfplumber to extract text, then searches for the Abstract section.
+    """
+    if not PDF_EXTRACTION_AVAILABLE:
+        return None, 'pdfplumber_not_installed'
+    if not pdf_url or pd.isna(pdf_url):
+        return None, 'no_pdf_url'
+
+    try:
+        oa_url_rate_limiter.wait()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+        resp = requests.get(str(pdf_url), headers=headers, timeout=30, stream=True)
+        resp.raise_for_status()
+
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp_path = tmp.name
+            for chunk in resp.iter_content(chunk_size=8192):
+                tmp.write(chunk)
+
+        try:
+            with pdfplumber.open(tmp_path) as pdf:
+                text_pages = []
+                for page in pdf.pages[:3]:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_pages.append(page_text)
+                full_text = '\n'.join(text_pages)
+
+            if not full_text or len(full_text) < 100:
+                return None, 'pdf_no_text'
+
+            # Search for abstract section
+            patterns = [
+                r'(?i)(?:^|\n)\s*A\s*B\s*S\s*T\s*R\s*A\s*C\s*T\s*[:\.]?\s*\n(.+?)(?=\n\s*(?:1\.|I\.|Introduction|INTRODUCTION|Keywords|Key\s*words|1\s+Introduction|JEL))',
+                r'(?i)(?:^|\n)\s*Abstract\s*[:\.]?\s*\n(.+?)(?=\n\s*(?:1\.|I\.|Introduction|INTRODUCTION|Keywords|Key\s*words|1\s+Introduction|JEL))',
+                r'(?i)(?:^|\n)\s*Summary\s*[:\.]?\s*\n(.+?)(?=\n\s*(?:1\.|I\.|Introduction|INTRODUCTION|Keywords|Key\s*words|JEL))',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, full_text, re.DOTALL)
+                if match:
+                    candidate = ' '.join(match.group(1).split())
+                    if len(candidate) > 100:
+                        candidate = re.sub(r'^(?:Abstract|Summary)[:\.]?\s*', '', candidate, flags=re.I)
+                        return candidate.strip()[:3000], None
+
+            # Fallback: text after "Abstract" keyword
+            abstract_start = re.search(r'(?i)(?:abstract|summary)[:\.]?\s*', full_text)
+            if abstract_start:
+                remaining = full_text[abstract_start.end():abstract_start.end() + 2000]
+                end_match = re.search(r'\n\s*(?:1\.|I\.|Introduction|INTRODUCTION|Keywords|Key\s*words|\d+\.\s+[A-Z]|JEL)', remaining)
+                if end_match:
+                    text = remaining[:end_match.start()].strip()
+                else:
+                    text = remaining[:1500].strip()
+                text = ' '.join(text.split())
+                if len(text) > 100:
+                    return text[:3000], None
+
+            return None, 'pdf_no_abstract_found'
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        return None, f'pdf_error: {str(e)[:80]}'
+
+
+def create_selenium_browser():
+    """Create a headless Chrome browser for JS-rendered page scraping."""
+    if not SELENIUM_AVAILABLE:
+        return None
+    chrome_options = ChromeOptions()
+    chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument(
+        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_experimental_option('prefs', {
+        'profile.managed_default_content_settings.images': 2,
+    })
+    browser = webdriver.Chrome(options=chrome_options)
+    browser.set_page_load_timeout(30)
+    return browser
+
+
+def recover_abstract_selenium(url_str, browser):
+    """
+    Scrape abstract from a JS-rendered page using Selenium.
+    Used for SSRN and other pages that require JavaScript.
+    """
+    if not browser:
+        return None, 'no_browser'
+    try:
+        browser.get(url_str)
+        abstract_text = None
+
+        # Try CSS selectors for abstract content
+        selectors = [
+            '[class*="abstract"]',
+            '[id*="abstract"]',
+            'div.abstract-text',
+            'div.abstract',
+            'section.abstract',
+        ]
+        for selector in selectors:
+            try:
+                elements = browser.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    text = elem.text.strip()
+                    if len(text) > 100:
+                        abstract_text = text
+                        break
+            except Exception:
+                continue
+            if abstract_text:
+                break
+
+        # Try finding "Abstract" heading followed by content
+        if not abstract_text:
+            try:
+                headings = browser.find_elements(By.CSS_SELECTOR, 'h1, h2, h3, h4, strong, b')
+                for heading in headings:
+                    if heading.text.strip().lower() in ('abstract', 'summary', 'abstract:'):
+                        try:
+                            parent = heading.find_element(By.XPATH, '..')
+                            content = parent.text.replace(heading.text.strip(), '').strip()
+                            if len(content) > 100:
+                                abstract_text = content
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if abstract_text:
+            abstract_text = ' '.join(abstract_text.split())
+            abstract_text = re.sub(r'^(?:Abstract|Summary)[:\.]?\s*', '', abstract_text, flags=re.I)
+            if len(abstract_text.strip()) > 50:
+                return abstract_text.strip(), None
+        return None, 'selenium_no_abstract'
+    except (TimeoutException, WebDriverException) as e:
+        return None, f'selenium_error: {str(e)[:80]}'
+    except Exception as e:
+        return None, f'selenium_error: {str(e)[:80]}'
+
+
+# =============================================================================
+# SSRN ABSTRACT RECOVERY (undetected-chromedriver + Cloudflare bypass)
+# =============================================================================
+def is_ssrn_paper(doi):
+    """Check if paper is from SSRN based on DOI pattern."""
+    if not doi or pd.isna(doi):
+        return False
+    return '10.2139/ssrn.' in str(doi).strip().lower()
+
+
+def ssrn_url_from_doi(doi):
+    """Build SSRN abstract page URL from DOI (10.2139/ssrn.XXXXXXX)."""
+    match = re.search(r'10\.2139/ssrn\.(\d+)', str(doi), re.I)
+    if not match:
+        return None
+    return f'https://papers.ssrn.com/sol3/papers.cfm?abstract_id={match.group(1)}'
+
+
+def wait_for_cloudflare(browser, timeout=120):
+    """
+    Detect Cloudflare challenge page and wait for user to solve CAPTCHA.
+    Returns True if resolved or not a Cloudflare page, False on timeout.
+    """
+    try:
+        title = browser.title.strip()
+    except Exception:
+        return True
+
+    if title != 'Just a moment...':
+        return True
+
+    print("    [CAPTCHA] Cloudflare challenge detected — please solve it in the browser")
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(2)
+        try:
+            title = browser.title.strip()
+            if title != 'Just a moment...':
+                print(f"    [CAPTCHA] Solved! Page title: {title[:60]}")
+                time.sleep(2)
+                return True
+        except Exception:
+            return False
+    print(f"    [CAPTCHA] Timeout after {timeout}s")
+    return False
+
+
+def _clean_abstract_text(text):
+    """Clean and normalize abstract text."""
+    if not text:
+        return ''
+    text = re.sub(r'<[^>]+>', '', text)
+    text = ' '.join(text.split())
+    text = re.sub(r'^(Abstract|Summary|ABSTRACT|SUMMARY)[.:]?\s*', '', text)
+    return text.strip()
+
+
+def _clean_ssrn_abstract(text):
+    """
+    Remove SSRN page metadata from extracted abstract text.
+
+    SSRN pages wrap the abstract in a container that also includes paper
+    metadata (page count, posting date) and footer info (keywords, JEL codes,
+    eJournal references). This strips all of that.
+    """
+    # Remove header block: "N Pages Posted: ... Date Written: DATE"
+    text = re.sub(
+        r'^\d+\s+Pages\s+Posted:.*?(?:Date Written:.*?\d{4})\s*',
+        '', text, flags=re.DOTALL
+    )
+    if re.match(r'^\d+\s+Pages\s+Posted:', text):
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if len(line) > 50 and line[0].isupper() and not line.startswith(('Posted', 'Last revised')):
+                text = '\n'.join(lines[i:])
+                break
+
+    # Remove trailing keywords, JEL codes, eJournal references
+    text = re.sub(r'\s*Keywords?:.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'\s*JEL Classification:.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'\s*Suggested Citation:.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'\s+[\w\s&]+eJournal.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'\s+[\w\s&]+Research Paper Series.*$', '', text, flags=re.DOTALL)
+
+    return text.strip()
+
+
+def _extract_abstract_from_page(browser):
+    """
+    Extract abstract from the current page using multiple strategies.
+
+    Strategy order:
+        1. citation_abstract meta tag (full abstract, most reliable)
+        2. CSS selectors for publisher abstract containers
+        3. Heading-based fallback (find "Abstract" heading, grab content)
+        4. og:description / description meta tags (last resort)
+
+    Returns str or None.
+    """
+    # Strategy 1: citation_abstract meta tag
+    try:
+        for meta_sel in ['meta[name="citation_abstract"]', 'meta[name="DC.description"]']:
+            metas = browser.find_elements(By.CSS_SELECTOR, meta_sel)
+            for meta in metas:
+                content = meta.get_attribute('content')
+                if content and len(content.strip()) > 100:
+                    return _clean_abstract_text(content)
+    except Exception:
+        pass
+
+    # Strategy 2: CSS selectors for abstract containers
+    abstract_selectors = [
+        'div[class*="abstract"] p',
+        'section[class*="abstract"] p',
+        'div[id*="abstract"] p',
+        'div.abstract p',
+        'section.abstract p',
+        'div.abstract-text p',
+        'div#abstract p',
+    ]
+
+    for selector in abstract_selectors:
+        try:
+            elements = browser.find_elements(By.CSS_SELECTOR, selector)
+            texts = []
+            for elem in elements:
+                text = elem.text.strip()
+                if text and len(text) > 20:
+                    texts.append(text)
+            combined = ' '.join(texts)
+            if len(combined) > 100:
+                return _clean_abstract_text(combined)
+        except Exception:
+            continue
+
+    # Strategy 3: Find heading with "Abstract" and grab sibling/parent text
+    try:
+        headings = browser.find_elements(By.CSS_SELECTOR, 'h1, h2, h3, h4')
+        for heading in headings:
+            if 'abstract' in heading.text.lower():
+                parent = heading.find_element(By.XPATH, '..')
+                parent_text = parent.text.strip()
+                content = parent_text.replace(heading.text.strip(), '').strip()
+                if len(content) > 100:
+                    return _clean_abstract_text(content)
+    except Exception:
+        pass
+
+    # Strategy 4: og:description meta tags (often truncated)
+    try:
+        for meta_sel in ['meta[property="og:description"]', 'meta[name="description"]']:
+            metas = browser.find_elements(By.CSS_SELECTOR, meta_sel)
+            for meta in metas:
+                content = meta.get_attribute('content')
+                if not content:
+                    continue
+                content = content.strip()
+                if len(content) < 250 and content.endswith(('\u2026', '...')):
+                    continue
+                if len(content) > 100:
+                    return _clean_abstract_text(content)
+    except Exception:
+        pass
+
+    return None
+
+
+def create_ssrn_browser():
+    """
+    Create visible Chrome browser with persistent profile for SSRN scraping.
+
+    Uses undetected-chromedriver to bypass Cloudflare bot detection.
+    The profile persists cf_clearance cookies so the user only solves
+    the CAPTCHA once. Browser is VISIBLE (not headless) because Cloudflare
+    Turnstile requires user interaction.
+    """
+    if not UC_AVAILABLE:
+        print("  [SSRN] undetected-chromedriver not installed (pip install undetected-chromedriver)")
+        return None
+    os.makedirs(SSRN_PROFILE_DIR, exist_ok=True)
+    options = uc.ChromeOptions()
+    options.add_argument(f'--user-data-dir={SSRN_PROFILE_DIR}')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--window-size=1920,1080')
+    # Detect installed Chrome version to avoid chromedriver mismatch
+    chrome_ver = None
+    try:
+        chrome_dir = os.path.join(os.environ.get('PROGRAMFILES', r'C:\Program Files'),
+                                  'Google', 'Chrome', 'Application')
+        if os.path.isdir(chrome_dir):
+            for entry in os.listdir(chrome_dir):
+                if entry[0].isdigit() and '.' in entry:
+                    chrome_ver = int(entry.split('.')[0])
+                    break
+    except Exception:
+        pass
+    try:
+        if chrome_ver:
+            print(f"  [SSRN] Detected Chrome version {chrome_ver}")
+            browser = uc.Chrome(options=options, version_main=chrome_ver, use_subprocess=True)
+        else:
+            browser = uc.Chrome(options=options, use_subprocess=True)
+        browser.set_page_load_timeout(60)
+        print(f"  [SSRN] Browser launched (profile: {SSRN_PROFILE_DIR})")
+        return browser
+    except Exception as e:
+        print(f"  [SSRN] Failed to launch browser: {e}")
+        return None
+
+
+def recover_single_ssrn(browser, ssrn_url):
+    """
+    Scrape abstract from a single SSRN page using undetected-chromedriver.
+
+    Handles Cloudflare Turnstile by pausing for user to solve CAPTCHA
+    on first encounter. Once cf_clearance cookie is set, subsequent
+    pages load automatically.
+
+    Returns tuple: (abstract_text or None, error_string or None)
+    """
+    try:
+        browser.get(ssrn_url)
+        time.sleep(3)
+
+        if not wait_for_cloudflare(browser):
+            return None, 'cloudflare_timeout'
+
+        time.sleep(2)
+
+        abstract = _extract_abstract_from_page(browser)
+        if abstract:
+            abstract = _clean_ssrn_abstract(abstract)
+            if len(abstract.strip()) > 50:
+                return abstract.strip(), None
+
+        return None, 'ssrn_no_abstract'
+    except Exception as e:
+        return None, f'ssrn_error: {str(e)[:80]}'
+
+
+def recover_abstracts_ssrn(df, checkpoint_path=None):
+    """
+    Recover abstracts for SSRN papers using visible browser with Cloudflare bypass.
+
+    Semi-automated: requires user to solve one Cloudflare CAPTCHA on first page.
+    After that, subsequent pages load automatically via persisted cf_clearance cookie.
+
+    Parameters:
+        df : pd.DataFrame with 'doi' and 'abstract' columns
+        checkpoint_path : str or None, path for SSRN checkpoint JSON
+
+    Returns:
+        tuple: (pd.DataFrame with recovered abstracts, dict with stats)
+    """
+    still_missing = df['abstract'].fillna('').astype(str).str.len() <= 50
+    is_ssrn = df['doi'].fillna('').apply(is_ssrn_paper)
+    ssrn_candidates = df.index[still_missing & is_ssrn].tolist()
+
+    stats = {'attempted': 0, 'recovered': 0}
+
+    if not ssrn_candidates:
+        print("  [SSRN] No SSRN papers need abstract recovery")
+        return df, stats
+
+    print(f"\n  === SSRN RECOVERY ({len(ssrn_candidates)} papers) ===")
+    print(f"  Semi-automated: solve Cloudflare CAPTCHA once, then automatic")
+    print(f"  Profile: {SSRN_PROFILE_DIR}")
+
+    # Load checkpoint if resuming
+    processed_indices = set()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, 'r') as f:
+            cp_data = json.load(f)
+        processed_indices = set(cp_data.get('processed_indices', []))
+        stats['recovered'] = cp_data.get('recovered', 0)
+        print(f"  [SSRN] Resumed: {len(processed_indices)} already processed, {stats['recovered']} recovered")
+
+    ssrn_candidates = [idx for idx in ssrn_candidates if idx not in processed_indices]
+    if not ssrn_candidates:
+        print("  [SSRN] All candidates already processed (checkpoint)")
+        return df, stats
+
+    stats['attempted'] = len(ssrn_candidates) + len(processed_indices)
+    browser = None
+    try:
+        browser = create_ssrn_browser()
+        if not browser:
+            return df, stats
+
+        for i, idx in enumerate(ssrn_candidates):
+            doi = str(df.loc[idx, 'doi']).strip()
+            ssrn_url = ssrn_url_from_doi(doi)
+            if not ssrn_url:
+                processed_indices.add(int(idx))
+                continue
+
+            abstract, error = recover_single_ssrn(browser, ssrn_url)
+            processed_indices.add(int(idx))
+
+            if abstract:
+                df.loc[idx, 'abstract'] = abstract
+                df.loc[idx, 'abstract_source'] = 'SSRN_web'
+                stats['recovered'] += 1
+
+            # Progress + checkpoint
+            if (i + 1) % SSRN_CHECKPOINT_INTERVAL == 0 or (i + 1) == len(ssrn_candidates):
+                print(f"    SSRN progress: {i+1}/{len(ssrn_candidates)} | Recovered: {stats['recovered']}")
+                if checkpoint_path:
+                    with open(checkpoint_path, 'w') as f:
+                        json.dump({
+                            'processed_indices': [int(x) for x in processed_indices],
+                            'recovered': stats['recovered'],
+                            'timestamp': datetime.now().isoformat()
+                        }, f)
+
+            time.sleep(SSRN_DELAY)
+
+        print(f"  [SSRN] Recovery complete: {stats['recovered']}/{stats['attempted']} recovered")
+    except KeyboardInterrupt:
+        print(f"\n  [SSRN] Interrupted — saving checkpoint ({stats['recovered']} recovered so far)")
+        if checkpoint_path:
+            with open(checkpoint_path, 'w') as f:
+                json.dump({
+                    'processed_indices': [int(x) for x in processed_indices],
+                    'recovered': stats['recovered'],
+                    'timestamp': datetime.now().isoformat()
+                }, f)
+    except Exception as e:
+        print(f"  [SSRN] Error: {e}")
+    finally:
+        if browser:
+            try:
+                browser.quit()
+            except Exception:
+                pass
+
+    return df, stats
+
+
+def recover_abstract_nber_website(nber_id):
+    """Scrape abstract from NBER website."""
+    if not nber_id or pd.isna(nber_id):
+        return None, 'no_nber_id'
+    nber_str = str(nber_id).strip()
+    match = re.search(r'w?(\d{4,6})', nber_str)
+    if not match:
+        return None, 'nber_id_parse_error'
+    wp_num = match.group(1)
+    try:
+        nber_web_rate_limiter.wait()
+        url = f"https://www.nber.org/papers/w{wp_num}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Academic research)'}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, f'nber_web_http_{resp.status_code}'
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        for selector in [
+            'div.page-header__intro-inner',
+            'div.page-header__intro',
+            'div[class*="abstract"]',
+            'meta[name="description"]',
+        ]:
+            elem = soup.select_one(selector)
+            if elem:
+                text = elem.get('content', '') if elem.name == 'meta' else elem.get_text(separator=' ', strip=True)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > 50:
+                    return text, None
+        return None, 'nber_web_no_abstract'
+    except Exception as e:
+        return None, f'nber_web_error: {str(e)[:80]}'
+
+
+def _title_similar(a, b):
+    """Check if two titles are similar enough to be the same paper."""
+    words_a = set(re.sub(r'[^\w\s]', '', a).split())
+    words_b = set(re.sub(r'[^\w\s]', '', b).split())
+    if not words_a or not words_b:
+        return False
+    overlap = len(words_a & words_b)
+    return overlap / min(len(words_a), len(words_b)) > 0.8
+
+
+def recover_abstract_ss_title(title):
+    """Search Semantic Scholar by title to find abstract (for papers without DOI)."""
+    if not title or pd.isna(title):
+        return None, 'no_title'
+    title_clean = str(title).strip()
+    if len(title_clean) < 10:
+        return None, 'title_too_short'
+    try:
+        ss_rate_limiter.wait()
+        url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            'query': title_clean[:200],
+            'fields': 'title,abstract',
+            'limit': 3,
+        }
+        headers = {'x-api-key': SS_API_KEY} if SS_API_KEY else {}
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None, f'ss_title_http_{resp.status_code}'
+        papers = resp.json().get('data', [])
+        title_lower = title_clean.lower()
+        for paper in papers:
+            p_title = (paper.get('title') or '').lower()
+            if p_title and _title_similar(title_lower, p_title):
+                abstract = paper.get('abstract', '')
+                if abstract and len(abstract.strip()) > 50:
+                    return abstract.strip(), None
+        return None, 'ss_title_no_match'
+    except Exception as e:
+        return None, f'ss_title_error: {str(e)[:80]}'
+
+
+def recover_single_paper(row_data):
+    """
+    Recover abstract for a single paper using multiple sources.
+
+    Ordered by success rate and speed (based on complement_abstracts TCJA data):
+      1. CrossRef (DOI)       — 18.1% success, fast  (~0.1s/req)
+      2. Europe PMC (DOI)     — 11.2% success, fast  (~0.15s/req)
+      3. OpenAlex re-fetch    — unknown, fast         (~0.1s/req)
+      4. SS DOI lookup        —  1.1% success, slow   (~1.1s/req)
+      5. OA URL scraping      —  3.4% success, moderate (~0.3s/req)
+      6. NBER website         — targeted (NBER only), moderate (~0.5s/req)
+      7. SS title search      — last resort for papers without DOIs
+
+    Parameters:
+    -----------
+    row_data : dict
+        Paper data with keys: doi, openalex_id, open_access_url, nber_id,
+        in_nber, title
 
     Returns:
     --------
     tuple : (abstract_text or None, source_name or None)
     """
-    abstract, error = recover_abstract_crossref(doi)
-    if abstract:
-        return abstract, 'CrossRef'
+    doi = row_data.get('doi')
+    has_doi = doi and not pd.isna(doi) and str(doi).strip()
 
-    abstract, error = recover_abstract_ss(doi)
-    if abstract:
-        return abstract, 'SemanticScholar_recovery'
+    # 1. CrossRef (DOI) — 18.1% success, fast
+    if has_doi:
+        abstract, error = recover_abstract_crossref(doi)
+        if abstract:
+            return abstract, 'CrossRef'
+
+    # 2. Europe PMC (DOI) — 11.2% success, fast
+    if has_doi:
+        abstract, error = recover_abstract_epmc(doi)
+        if abstract:
+            return abstract, 'EuropePMC'
+
+    # 3. OpenAlex re-fetch (by openalex_id) — fast
+    openalex_id = row_data.get('openalex_id')
+    if openalex_id and not pd.isna(openalex_id):
+        abstract, error = recover_abstract_openalex(openalex_id)
+        if abstract:
+            return abstract, 'OpenAlex_recovery'
+
+    # 4. Semantic Scholar DOI lookup — 1.1% success, slow
+    if has_doi:
+        abstract, error = recover_abstract_ss(doi)
+        if abstract:
+            return abstract, 'SemanticScholar_recovery'
+
+    # 5. OA URL scraping — 3.4% success, moderate speed
+    #    If PDF detected, try PDF extraction (28.9% success on PDFs)
+    oa_url = row_data.get('open_access_url')
+    oa_url_error = None
+    if oa_url and not pd.isna(oa_url):
+        abstract, oa_url_error = recover_abstract_oa_url(oa_url)
+        if abstract:
+            return abstract, 'OA_URL'
+        # 5a. PDF extraction — if OA URL points to a PDF
+        if oa_url_error == 'oa_url_is_pdf':
+            abstract, error = recover_abstract_pdf(oa_url)
+            if abstract:
+                return abstract, 'PDF_extraction'
+
+    # 6. NBER website scraping — targeted, only for NBER papers
+    in_nber = row_data.get('in_nber', False)
+    nber_id = row_data.get('nber_id')
+    if in_nber and nber_id and not pd.isna(nber_id):
+        abstract, error = recover_abstract_nber_website(nber_id)
+        if abstract:
+            return abstract, 'NBER_website'
+
+    # 7. SS title search — last resort, for papers without DOIs
+    if not has_doi:
+        title = row_data.get('title')
+        if title:
+            abstract, error = recover_abstract_ss_title(title)
+            if abstract:
+                return abstract, 'SS_title_search'
 
     return None, None
 
 
 def recover_missing_abstracts(df, checkpoint_path=None):
     """
-    Recover missing abstracts using CrossRef and Semantic Scholar APIs.
-    Uses parallel workers for speed. Times first 20 papers to estimate total.
-    Saves checkpoints periodically so recovery can resume after interruptions.
+    Recover missing abstracts using multiple sources:
+    CrossRef, Semantic Scholar, Europe PMC, OpenAlex re-fetch,
+    OA URL scraping, NBER website, and SS title search.
+
+    Processes ALL papers without abstracts (not just those with DOIs).
+    Uses parallel workers. Times first 20 papers to estimate total.
+    Saves checkpoints periodically so recovery can resume.
 
     Parameters:
     -----------
     df : pd.DataFrame
-        Papers DataFrame with 'abstract' and 'doi' columns
+        Papers DataFrame with 'abstract' column
     checkpoint_path : str or None
         Path to save periodic checkpoints during recovery. If None, no
         checkpoints are saved.
@@ -1231,25 +2124,51 @@ def recover_missing_abstracts(df, checkpoint_path=None):
     has_abstract = df['abstract'].fillna('').astype(str).str.len() > 50
     df.loc[has_abstract & (df['abstract_source'] == ''), 'abstract_source'] = 'original'
 
-    missing_mask = ~has_abstract & df['doi'].notna() & (df['doi'] != '')
+    # Process ALL papers without abstracts (not just those with DOIs)
+    missing_mask = ~has_abstract
     missing_indices = df.index[missing_mask].tolist()
 
     if not missing_indices:
         print(f"  No papers need abstract recovery (all {len(df)} have abstracts)")
         return df
 
+    # Diagnostic breakdown
+    has_doi = df.loc[missing_mask, 'doi'].fillna('').str.len() > 0
+    has_oaid = (df.loc[missing_mask, 'openalex_id'].fillna('').astype(str).str.len() > 2
+                if 'openalex_id' in df.columns
+                else pd.Series(False, index=df.loc[missing_mask].index))
+    has_oa_url = (df.loc[missing_mask, 'open_access_url'].fillna('').astype(str).str.len() > 5
+                  if 'open_access_url' in df.columns
+                  else pd.Series(False, index=df.loc[missing_mask].index))
+    has_nber = (df.loc[missing_mask, 'in_nber'].fillna(False).astype(bool)
+                if 'in_nber' in df.columns
+                else pd.Series(False, index=df.loc[missing_mask].index))
+
     print(f"\n  === ABSTRACT RECOVERY ({RECOVERY_WORKERS} parallel workers) ===")
-    print(f"  Papers missing abstracts with DOIs: {len(missing_indices)}")
+    print(f"  Papers missing abstracts: {len(missing_indices)}")
+    print(f"    With DOI: {has_doi.sum()}")
+    print(f"    With OpenAlex ID: {has_oaid.sum()}")
+    print(f"    With OA URL: {has_oa_url.sum()}")
+    print(f"    NBER papers: {has_nber.sum()}")
+    print(f"    No DOI: {(~has_doi).sum()}")
+    print(f"  Sources: CrossRef -> EPMC -> OpenAlex -> SS(DOI) -> OA URL/PDF -> NBER -> SS title -> Selenium")
 
     recovered = 0
     completed = 0
+    source_counts = {}
     timing_start = time.time()
     timing_reported = False
     results_lock = threading.Lock()
 
+    # Columns needed for recovery
+    needed_cols = ['doi', 'title']
+    for col in ['openalex_id', 'open_access_url', 'nber_id', 'in_nber']:
+        if col in df.columns:
+            needed_cols.append(col)
+
     def process_paper(idx):
-        doi = df.loc[idx, 'doi']
-        return idx, *recover_single_paper(doi)
+        row_data = {col: df.loc[idx, col] for col in needed_cols if col in df.columns}
+        return idx, *recover_single_paper(row_data)
 
     with ThreadPoolExecutor(max_workers=RECOVERY_WORKERS) as executor:
         futures = {executor.submit(process_paper, idx): idx for idx in missing_indices}
@@ -1263,6 +2182,7 @@ def recover_missing_abstracts(df, checkpoint_path=None):
                         df.loc[idx, 'abstract'] = abstract
                         df.loc[idx, 'abstract_source'] = source
                         recovered += 1
+                        source_counts[source] = source_counts.get(source, 0) + 1
 
                     # Timing estimate after first 20
                     if completed == 20 and not timing_reported:
@@ -1283,18 +2203,71 @@ def recover_missing_abstracts(df, checkpoint_path=None):
             except Exception as e:
                 print(f"  Recovery error: {e}")
 
-    # Save final checkpoint before returning
+    # Save checkpoint after parallel pass
     if checkpoint_path:
         df.to_parquet(checkpoint_path, index=False, engine='pyarrow')
 
-    print(f"  Abstract recovery complete: {recovered}/{len(missing_indices)} recovered")
+    print(f"\n  Parallel recovery: {recovered}/{len(missing_indices)} recovered")
+    if source_counts:
+        print(f"  By source: {source_counts}")
+
+    # === SELENIUM PASS (sequential) ===
+    # For papers still missing abstracts that have OA URLs, try Selenium.
+    # Selenium is not thread-safe, so this runs sequentially with one browser.
+    if SELENIUM_AVAILABLE:
+        still_missing = df['abstract'].fillna('').astype(str).str.len() <= 50
+        has_oa = (df['open_access_url'].fillna('').astype(str).str.len() > 5
+                  if 'open_access_url' in df.columns
+                  else pd.Series(False, index=df.index))
+        selenium_candidates = df.index[still_missing & has_oa].tolist()
+
+        if selenium_candidates:
+            print(f"\n  === SELENIUM PASS ({len(selenium_candidates)} papers with OA URLs) ===")
+            browser = None
+            selenium_recovered = 0
+            try:
+                browser = create_selenium_browser()
+                if browser:
+                    for i, idx in enumerate(selenium_candidates):
+                        oa_url = str(df.loc[idx, 'open_access_url']).strip()
+                        abstract, error = recover_abstract_selenium(oa_url, browser)
+                        if abstract:
+                            df.loc[idx, 'abstract'] = abstract
+                            df.loc[idx, 'abstract_source'] = 'Selenium'
+                            selenium_recovered += 1
+                            recovered += 1
+                            source_counts['Selenium'] = source_counts.get('Selenium', 0) + 1
+                        if (i + 1) % 20 == 0:
+                            print(f"    Selenium progress: {i+1}/{len(selenium_candidates)} | "
+                                  f"Recovered: {selenium_recovered}")
+                            if checkpoint_path:
+                                df.to_parquet(checkpoint_path, index=False, engine='pyarrow')
+                    print(f"  Selenium recovery: {selenium_recovered}/{len(selenium_candidates)}")
+            except Exception as e:
+                print(f"  Selenium error: {e}")
+            finally:
+                if browser:
+                    try:
+                        browser.quit()
+                    except Exception:
+                        pass
+    else:
+        print("\n  Selenium not available (install selenium + chromedriver for JS-rendered pages)")
+
+    # Save final checkpoint
+    if checkpoint_path:
+        df.to_parquet(checkpoint_path, index=False, engine='pyarrow')
+
+    print(f"\n  Total recovery: {recovered}/{len(missing_indices)} recovered")
+    if source_counts:
+        print(f"  By source: {source_counts}")
     return df
 
 
 # =============================================================================
 # MAIN PROCESS
 # =============================================================================
-def process_policy(policy_row, resume=False):
+def process_policy(policy_row, resume=False, ssrn_mode=False):
     """
     Process a single policy through all three econ-restricted sources.
 
@@ -1334,14 +2307,48 @@ def process_policy(policy_row, resume=False):
     raw_output_path = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_econ_apis_raw.parquet")
     filtered_output_path = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_econ_apis_filtered.parquet")
 
-    # If final outputs already exist on resume, skip entirely
+    # If final outputs already exist on resume, skip pipeline (but allow SSRN recovery)
     if resume and os.path.exists(raw_output_path) and os.path.exists(filtered_output_path):
-        print(f"  [RESUME] Final outputs already exist, skipping entirely")
-        metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_econ_apis_metadata.json")
-        if os.path.exists(metadata_file):
-            with open(metadata_file) as f:
-                return json.load(f)
-        return {'policy_abbreviation': policy_abbr, 'total_papers': 0, 'skipped': True}
+        if ssrn_mode:
+            print(f"  [RESUME] Final outputs exist — skipping pipeline, running SSRN recovery")
+            filtered = pd.read_parquet(filtered_output_path)
+            merged = pd.read_parquet(raw_output_path)
+
+            ssrn_cp = os.path.join(TMP_DIR, f"{policy_abbr}_ssrn_checkpoint.json")
+            pre_ssrn = len(filtered)
+            filtered, ssrn_stats = recover_abstracts_ssrn(filtered, checkpoint_path=ssrn_cp)
+            filtered = filter_by_relevance(filtered, search_terms)
+            filtered, _ = validate_acronym_matches(filtered)
+            post_ssrn = len(filtered)
+            ssrn_stats['dropped_after_refilter'] = pre_ssrn - post_ssrn
+            print(f"  [SSRN] After re-filter: {pre_ssrn} -> {post_ssrn} ({pre_ssrn - post_ssrn} dropped)")
+            filtered.to_parquet(filtered_output_path, index=False, engine='pyarrow')
+            filtered_csv = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_econ_apis_filtered.csv")
+            filtered.to_csv(filtered_csv, index=False, encoding='utf-8')
+            print(f"  [SSRN] Re-saved filtered outputs")
+
+            # Update metadata
+            metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_econ_apis_metadata.json")
+            if os.path.exists(metadata_file):
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                metadata['ssrn_recovery'] = ssrn_stats
+                has_abs = filtered['abstract'].fillna('').astype(str).str.len() > 50
+                metadata['filtered']['total_papers'] = len(filtered)
+                metadata['filtered']['with_abstract'] = int(has_abs.sum())
+                metadata['filtered']['without_abstract'] = int((~has_abs).sum())
+                metadata['filtered']['abstract_pct'] = round(100 * has_abs.mean(), 1) if len(filtered) > 0 else 0
+                with open(metadata_file, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                return metadata
+            return {'policy_abbreviation': policy_abbr, 'ssrn_recovery': ssrn_stats}
+        else:
+            print(f"  [RESUME] Final outputs already exist, skipping entirely")
+            metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_econ_apis_metadata.json")
+            if os.path.exists(metadata_file):
+                with open(metadata_file) as f:
+                    return json.load(f)
+            return {'policy_abbreviation': policy_abbr, 'total_papers': 0, 'skipped': True}
 
     # Determine resume stage: can we skip scrape+merge?
     skip_to_recovery = False
@@ -1417,6 +2424,9 @@ def process_policy(policy_row, resume=False):
         # Step 3: Acronym validation
         merged, acronym_filtered = validate_acronym_matches(merged)
 
+        # Step 3b: Filter NBER non-papers (conferences, meetings, book content)
+        merged, nber_junk_filtered = filter_nber_nonpapers(merged)
+
         # Step 4: Filter by publication year
         print(f"\n  Filtering by publication year (>= {policy_year})...")
         pre_year = len(merged)
@@ -1441,6 +2451,7 @@ def process_policy(policy_row, resume=False):
         print(f"  Saved merged checkpoint: {merged_checkpoint_path}")
     else:
         acronym_filtered = 0
+        nber_junk_filtered = 0
         year_filtered = 0
 
     # Step 5: Abstract recovery (with periodic checkpointing)
@@ -1470,6 +2481,25 @@ def process_policy(policy_row, resume=False):
     filtered_csv = os.path.join(OUTPUT_DIR, f"{policy_abbr}_papers_econ_apis_filtered.csv")
     filtered.to_csv(filtered_csv, index=False, encoding='utf-8')
     print(f"  Saved FILTERED CSV: {filtered_csv}")
+
+    # Step 7 (optional): SSRN abstract recovery via Cloudflare bypass
+    ssrn_stats = {'attempted': 0, 'recovered': 0, 'dropped_after_refilter': 0}
+    if ssrn_mode:
+        pre_ssrn = len(filtered)
+        ssrn_cp = os.path.join(TMP_DIR, f"{policy_abbr}_ssrn_checkpoint.json")
+        filtered, ssrn_stats = recover_abstracts_ssrn(filtered, checkpoint_path=ssrn_cp)
+
+        # Re-filter: papers with recovered abstracts may now fail relevance check
+        filtered = filter_by_relevance(filtered, search_terms)
+        filtered, _ = validate_acronym_matches(filtered)
+        post_ssrn = len(filtered)
+        ssrn_stats['dropped_after_refilter'] = pre_ssrn - post_ssrn
+        print(f"  [SSRN] After re-filter: {pre_ssrn} -> {post_ssrn} ({pre_ssrn - post_ssrn} dropped)")
+
+        # Re-save filtered outputs
+        filtered.to_parquet(filtered_output_path, index=False, engine='pyarrow')
+        filtered.to_csv(filtered_csv, index=False, encoding='utf-8')
+        print(f"  [SSRN] Re-saved filtered outputs")
 
     elapsed = time.time() - start_time
 
@@ -1502,6 +2532,7 @@ def process_policy(policy_row, resume=False):
         'raw': {
             'total_papers': len(merged),
             'acronym_filtered': acronym_filtered,
+            'nber_junk_filtered': nber_junk_filtered,
             'year_filtered': year_filtered,
             'with_abstract': int(has_abstract_raw.sum()),
             'without_abstract': int((~has_abstract_raw).sum()),
@@ -1515,7 +2546,8 @@ def process_policy(policy_row, resume=False):
             'without_abstract': int((~has_abstract_filtered).sum()),
             'abstract_pct': round(100 * has_abstract_filtered.mean(), 1) if len(filtered) > 0 else 0,
             'paper_types': filtered_types,
-        }
+        },
+        'ssrn_recovery': ssrn_stats,
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, f"{policy_abbr}_econ_apis_metadata.json")
@@ -1551,6 +2583,8 @@ def main():
                        help='Policy abbreviations to process (default: all)')
     parser.add_argument('--resume', action='store_true',
                        help='Resume from checkpoints (skip completed stages)')
+    parser.add_argument('--ssrn', action='store_true',
+                       help='Enable SSRN abstract recovery (semi-automated, requires CAPTCHA solving)')
     args = parser.parse_args()
 
     print("=" * 80)
@@ -1576,7 +2610,7 @@ def main():
     all_metadata = []
     for _, row in policies_df.iterrows():
         try:
-            metadata = process_policy(row, resume=args.resume)
+            metadata = process_policy(row, resume=args.resume, ssrn_mode=args.ssrn)
             all_metadata.append(metadata)
         except Exception as e:
             print(f"\n  ERROR processing {row['policy_name']}: {e}")
