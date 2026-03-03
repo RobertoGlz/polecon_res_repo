@@ -347,9 +347,10 @@ def run_full(policies: list[str],
         results = []
         start_time = time.time()
         errors_consecutive = 0
+        initial_done = len(done_ids)
 
         for i, (idx, row) in enumerate(remaining.iterrows()):
-            paper_num = len(done_ids) + i + 1
+            paper_num = initial_done + i + 1
             title_preview = str(row['title'])[:70] if pd.notna(row['title']) else '[No title]'
             print(f"  [{paper_num}/{total}] {title_preview}...", end=" ", flush=True)
 
@@ -386,20 +387,21 @@ def run_full(policies: list[str],
                 "error": result["error"],
             })
 
-            # Checkpoint every 50 papers
-            if (i + 1) % 50 == 0:
+            # Checkpoint every 10 papers
+            if (i + 1) % 10 == 0:
                 _save_checkpoint(results, done_ids, out_path, checkpoint_path,
                                  id_col, paper_num, total, start_time)
 
             time.sleep(0.1)
 
-        # Final save
-        _save_checkpoint(results, done_ids, out_path, checkpoint_path,
-                         id_col, len(done_ids) + len(results), total, start_time)
+        # Final save (results may be empty if last checkpoint just cleared it)
+        if results:
+            _save_checkpoint(results, done_ids, out_path, checkpoint_path,
+                             id_col, initial_done + n_remaining, total, start_time)
 
         elapsed = time.time() - start_time
-        print(f"\n  Classified {len(results)} papers in {elapsed:.0f}s "
-              f"({elapsed/max(len(results),1):.2f}s/paper)")
+        print(f"\n  Classified {n_remaining} papers in {elapsed:.0f}s "
+              f"({elapsed/max(n_remaining,1):.2f}s/paper)")
 
         # Summary
         all_df = pd.read_csv(out_path)
